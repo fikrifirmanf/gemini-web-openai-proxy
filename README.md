@@ -102,7 +102,7 @@ provider = "OpenAI", base URL as above, API key = anything.
 | Streaming (SSE) | True incremental deltas from `send_message_stream`; `stream_options.include_usage` supported; malformed upstream failures surface as an SSE `error` event, then `[DONE]` |
 | Vision & files | `[image_url]` content parts: `data:` URL, http(s) URL, or local path; also PDF/text file pairs (`file_url`); sent upstream as attachments |
 | Image generation | `/v1/images/generations` returns `b64_json` always — no Google CDN link leaking |
-| Thoughts | `reasoning_effort: "high"`/`"medium"` maps to extended thinking; internal thoughts stream as `reasoning_content` deltas |
+| Thoughts | `reasoning_effort`/`reasoning.effort` → Gemini Web extended thinking. Triggers: `medium`, `high`, `max`, `enabled` (the mapping is `wants_extended_thinking` in `schemas.py`); `none`/`low`/unset = standard mode. Thoughts stream as `reasoning_content` deltas (hide with `GWOP_INCLUDE_THOUGHTS=0`) |
 | Session reuse | Stateless requests are mapped onto a small LRU of live web conversations; a cache hit only sends your newest message upstream |
 | Cookies | Manual (env / raw header / cookies.txt). The library auto-refreshes `__Secure-1PSIDTS` and caches it under `GWOP_DATA_DIR/gemini_cookies` |
 | Auth | `GWOP_API_KEY` triggers Bearer-token enforcement on everything except `/health`/`/readyz` |
@@ -305,6 +305,18 @@ uv run python scripts/chat.py --prompt "…" --no-stream              # plain pr
 In-chat commands: `/help` `/new` `/model` `/effort` `/status` `/reinit` `/exit`
 (`--effort medium|high` enables Gemini thinking; thoughts stream in dim ink).
 Requires the proxy to be running (`uv run python -m gemini_openai_proxy`).
+
+#### Thinking-effort reality check (measured live)
+
+- **`gemini-flash` + effort** — works well: private thoughts stream as
+  `reasoning_content`, then the answer.
+- **`gemini-pro` + effort** — thinking engages (thoughts arrive) but the final
+  answer frequently turns into Google's "I seem to be encountering an error"
+  grovel, and turns take 40 s to minutes. Leave effort unset for `gemini-pro`
+  unless you enjoy waiting.
+- **Codex** — the CLI already sends `effort: "low"` by default, which the proxy
+  maps to standard (fast) mode. To turn thinking on for a profile, add
+  `model_reasoning_effort = "medium"` to its `~/.codex/<name>.config.toml`.
 
 ### End-to-end endpoint smoke test (against a running proxy)
 

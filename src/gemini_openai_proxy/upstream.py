@@ -486,13 +486,15 @@ class GeminiService:
         return system, history, final_text, last, model, display_name
 
     @staticmethod
-    def _hash_for(messages: list[Any], system: str | None, model_name: str) -> str:
+    def _hash_for(messages: list[Any], system: str | None, model_name: str, thinking: bool = False) -> str:
         payload = [
             {"role": str(m.role), "text": build_turn_text(str(m.role), m.content)[0]}
             for m in messages
         ]
         if system:
             payload.append({"role": "system", "text": system})
+        if thinking:
+            payload.append({"thinking": True})
         payload.append({"model": model_name})
         return _cache_key(payload)
 
@@ -508,10 +510,11 @@ class GeminiService:
     async def chat_non_stream(self, request: Any) -> tuple[Any, str, list[str]]:
         """Returns (final ModelOutput, advertised model name, media notes)."""
         await self._ensure_ready()
+        thinking = request.wants_extended_thinking
         system, history, final_text, _last, model_obj, display_name = self._split(request)
         messages = request.messages
-        full_key = self._hash_for(messages, system, display_name)
-        prefix_key = self._hash_for(messages[:-1], system, display_name)
+        full_key = self._hash_for(messages, system, display_name, thinking)
+        prefix_key = self._hash_for(messages[:-1], system, display_name, thinking)
         entry = self._sessions.get(prefix_key)
 
         if entry is not None:
@@ -519,7 +522,7 @@ class GeminiService:
             await collector.collect(messages, only_last=True)
             files, notes = collector.files, collector.notes
             try:
-                output = await self._send(entry.chat, final_text, files)
+                output = await self._send(entry.chat, final_text, files, thinking)
             finally:
                 self._cleanup_files(files)
             self._remember(full_key, entry.chat, display_name)
@@ -535,7 +538,7 @@ class GeminiService:
         )
         chat = self.client.start_chat(model=model_obj)
         try:
-            output = await self._send(chat, prompt, files)
+            output = await self._send(chat, prompt, files, thinking)
         finally:
             self._cleanup_files(files)
         self._remember(full_key, chat, display_name)
@@ -544,10 +547,11 @@ class GeminiService:
     async def chat_stream(self, request: Any) -> AsyncGenerator[Any, None]:
         """Yields incremental ModelOutput chunks; the final one carries images."""
         await self._ensure_ready()
+        thinking = request.wants_extended_thinking
         system, history, final_text, _last, model_obj, display_name = self._split(request)
         messages = request.messages
-        full_key = self._hash_for(messages, system, display_name)
-        prefix_key = self._hash_for(messages[:-1], system, display_name)
+        full_key = self._hash_for(messages, system, display_name, thinking)
+        prefix_key = self._hash_for(messages[:-1], system, display_name, thinking)
         entry = self._sessions.get(prefix_key)
 
         if entry is not None:
@@ -568,7 +572,7 @@ class GeminiService:
             )
 
         try:
-            async for chunk in self._send_raw(chat, prompt, files):
+            async for chunk in self._send_raw(chat, prompt, files, thinking):
                 yield chunk
         finally:
             self._cleanup_files(files)
@@ -679,7 +683,7 @@ class GeminiService:
                 self._on_send_mapped(mapped, self)
                 raise mapped from exc
 
-    async def _send(self, chat: Any, prompt: str, files: list[Path]) -> Any:
+    async def _send(self, chat: Any, prompt: str, files: list[Path], thinking: bool = False) -> Any:
         async with self._gate:
             await self._respect_send_interval()
             try:
@@ -687,13 +691,14 @@ class GeminiService:
                     prompt,
                     files=files or None,
                     temporary=self.settings.temporary_chats,
+                    extended_thinking=thinking,
                 )
             except Exception as exc:  # noqa: BLE001
                 mapped = map_exception(exc)
                 self._on_send_mapped(mapped, self)
                 raise mapped from exc
 
-    def _send_raw(self, chat: Any, prompt: str, files: list[Path]) -> AsyncGenerator[Any, None]:
+    def _send_raw(self, chat: Any, prompt: str, files: list[Path], thinking: bool = False) -> AsyncGenerator[Any, None]:
         async def _gen():
             async with self._gate:
                 await self._respect_send_interval()
@@ -702,6 +707,7 @@ class GeminiService:
                         prompt,
                         files=files or None,
                         temporary=self.settings.temporary_chats,
+                        extended_thinking=thinking,
                     ):
                         yield chunk
                 except Exception as exc:  # noqa: BLE001
