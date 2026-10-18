@@ -183,6 +183,20 @@ uv sync --all-groups
 uv run pytest tests/ -v          # 30 tests, offline, no cookies needed
 ```
 
+### CLI chatbot
+
+```bash
+uv run python scripts/chat.py                                   # model + effort pickers, then chat
+uv run python scripts/chat.py --model gemini-flash --effort high
+uv run python scripts/chat.py --model gemini-argon --effort medium --system "Reply like a pirate"
+uv run python scripts/chat.py --prompt "1+1?" --model gemini-flash   # one-shot for pipes/scripts
+uv run python scripts/chat.py --prompt "…" --no-stream              # plain print for automation
+```
+
+In-chat commands: `/help` `/new` `/model` `/effort` `/status` `/reinit` `/exit`
+(`--effort medium|high` enables Gemini thinking; thoughts stream in dim ink).
+Requires the proxy to be running (`uv run python -m gemini_openai_proxy`).
+
 ### End-to-end endpoint smoke test (against a running proxy)
 
 ```bash
