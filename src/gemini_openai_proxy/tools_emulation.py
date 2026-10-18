@@ -30,10 +30,16 @@ JSON object and nothing else:
 
 {"tool_calls": [{"name": "<function name>", "arguments": {<json params>}}]}
 
+Example valid reply:
+
+{"tool_calls": [{"name": "shell", "arguments": {"cmd": "ls -la"}}]}
+
 Rules:
 - `arguments` is always a JSON object (use {} when there are no parameters).
 - To run several functions, list them in one tool_calls array; they run in order.
 - NO markdown fences, NO prose, NO explanation before or after — only the JSON.
+- Pasting shell commands as markdown does NOT execute anything; the agent only
+  runs what arrives in the tool_calls JSON above.
 - When everything is done (or a plain answer suffices), reply normally in text.
 - Never invent `[Tool result]` content. Wait for it as a user-visible turn.
 
@@ -75,6 +81,49 @@ def _candidate_spans(text: str) -> list[str]:
     return out
 
 
+_BARE_KEY = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(\s*):")
+
+
+def _repair_json(candidate: str) -> str:
+    """Common Gemini Web corruptions: bare keys (`doctrine: ""`), a missing
+    comma before them, and stray trailing commas inside objects.
+    Second-chance parse only, after strict JSON failed. String-aware:
+    `key:` patterns inside string values stay untouched."""
+    out: list[str] = []
+    i, in_str, escaped, prev_sig = 0, False, False, ""
+    while i < len(candidate):
+        ch = candidate[i]
+        if in_str:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+                prev_sig = '"'
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        m = _BARE_KEY.match(candidate, i)
+        if m:
+            if prev_sig not in ("", "{", "[", ","):
+                out.append(",")  # value ends right before the bare key: ',' was lost
+            out.append(f'"{m.group(1)}"{m.group(2)}:')
+            prev_sig = ":"
+            i = m.end()
+            continue
+        out.append(ch)
+        if not ch.isspace():
+            prev_sig = ch
+        i += 1
+    return re.sub(r",\s*([}\]])", r"\1", "".join(out))
+
+
 def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
     """Lift `{"tool_calls": [...]}` out of a model reply.
 
@@ -85,32 +134,45 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
     if not text or "{" not in text:
         return None
     for candidate in _candidate_spans(text):
-        try:
-            data = json.loads(candidate, strict=False)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            if isinstance(data, list):
-                data = {"tool_calls": data}
-            else:
+        for attempt in (candidate, _repair_json(candidate)):
+            try:
+                data = json.loads(attempt, strict=False)
+                if attempt is not candidate:
+                    logger.info("tool JSON salvaged after bare-key/comma repair")
+            except (json.JSONDecodeError, ValueError):
                 continue
-        calls = data.get("tool_calls") or data.get("function_calls")
-        if not isinstance(calls, list) or not calls:
-            continue
-        normalized: list[dict[str, Any]] = []
-        for call in calls:
-            if not isinstance(call, dict):
-                continue
-            name = str(call.get("name") or (call.get("function") or {}).get("name") or "").strip()
-            if not name:
-                continue
-            args = call.get("arguments")
-            if isinstance(args, str) and args.strip():
-                normalized.append({"name": name, "arguments": args})
-            else:
-                payload = args if isinstance(args, (dict, list)) else {}
-                normalized.append({"name": name, "arguments": json.dumps(payload, ensure_ascii=False)})
-        if normalized:
-            logger.info("parsed %s emulated tool call(s): %s", len(normalized), [c["name"] for c in normalized])
-            return normalized
+            calls = _normalize_calls(data)
+            if calls:
+                logger.info("parsed %s emulated tool call(s): %s", len(calls), [c["name"] for c in calls])
+                return calls
     return None
+
+
+def _normalize_calls(data: Any) -> list[dict[str, Any]] | None:
+    if isinstance(data, list):
+        data = {"tool_calls": data}
+    if not isinstance(data, dict):
+        return None
+    calls = data.get("tool_calls") or data.get("function_calls")
+    if calls is None:
+        # OpenAI-native single-call shape the web model sometimes prefers:
+        # {"name": "...", "arguments": {...}} (or wrapped in "function_call")
+        single = data["function_call"] if isinstance(data.get("function_call"), dict) else data
+        if isinstance(single, dict) and str(single.get("name") or "").strip():
+            calls = [single]
+    if not isinstance(calls, list) or not calls:
+        return None
+    normalized: list[dict[str, Any]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        name = str(call.get("name") or (call.get("function") or {}).get("name") or "").strip()
+        if not name:
+            continue
+        args = call.get("arguments")
+        if isinstance(args, str) and args.strip():
+            normalized.append({"name": name, "arguments": args})
+        else:
+            payload = args if isinstance(args, (dict, list)) else {}
+            normalized.append({"name": name, "arguments": json.dumps(payload, ensure_ascii=False)})
+    return normalized or None

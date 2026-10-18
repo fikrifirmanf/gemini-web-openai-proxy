@@ -109,6 +109,66 @@ def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
+_CORRECTION_NOTE = (
+    "[Protocol correction] Your previous reply was malformed — the tool JSON got "
+    "corrupted. Reply again with EXACTLY one JSON object of the form "
+    '{"tool_calls": [{"name": ..., "arguments": {...}}]} '
+    "and nothing else: valid JSON, no extra keys, no markdown, no prose."
+)
+
+
+def _wants_retry(text: str) -> bool:
+    """Corrupt protocol output: the model clearly *attempted* a tool-call object
+    but the JSON did not parse (Gemini Web intermittently mangles it). One
+    corrective send max; prose that merely mentions "tool_calls" stays untouched."""
+    t = text.lstrip()
+    if not t or "{" not in t:
+        return False
+    return (
+        t.startswith("{")                                # pure-JSON reply that failed to parse
+        or '{"tool_calls"' in text                       # the object's header survived
+        or (t.startswith("```") and "tool_calls" in t[:200])  # fenced attempt
+    )
+
+
+def _corrective(chat_req, text: str):
+    """Clone the private chat request, appending one corrective user turn.
+
+    The upstream web session for the attempt-1 transcript is kept (the prefix
+    cache keys match), so the retry continues the very same web chat.
+    """
+    from ..schemas import ChatMessage
+
+    fixed = chat_req.model_copy(deep=True)
+    fixed.messages = [*fixed.messages, ChatMessage(role="user", content=_CORRECTION_NOTE)]
+    fixed.stream = chat_req.stream
+    return fixed
+
+
+async def _retry_malformed(svc, chat_req, text: str) -> tuple[str, list | None]:
+    """Shared by stream & non-stream (caller already checked `_wants_retry`).
+    Never raises: a failed retry falls back to the plain-message path."""
+    logger.warning("responses: malformed tool JSON, one corrective retry")
+    retry = _corrective(chat_req, text)
+    try:
+        if retry.stream:
+            buf: list[str] = []
+            async for chunk in svc.chat_stream(retry):
+                d = getattr(chunk, "text_delta", "") or ""
+                if d:
+                    buf.append(d)
+        else:
+            output, _model, _notes = await svc.chat_non_stream(retry)
+            buf = [_text_of(output)]
+        text2 = "".join(buf) or text
+        calls2 = tools_emulation.parse_tool_calls(text2)
+        logger.info("responses: corrective retry %s", "produced a tool call" if calls2 else "still plain")
+        return (text2 if calls2 else text), calls2
+    except Exception as exc:  # noqa: BLE001 - the fallback path must stay intact
+        logger.warning("responses: corrective retry failed (%s): %s", exc.__class__.__name__, exc)
+        return text, None
+
+
 @router.post("/v1/responses")
 async def responses(request: Request):
     svc = request.app.state.gemini
@@ -149,6 +209,8 @@ async def responses(request: Request):
         text = _text_of(output)
         if tools:
             calls = tools_emulation.parse_tool_calls(text)
+            if calls is None and _wants_retry(text):
+                text, calls = await _retry_malformed(svc, chat_req, text)
             if calls:
                 logger.info("responses %s: emitted %s emulated tool call(s)", resp_id[:14], len(calls))
                 return JSONResponse(
@@ -209,6 +271,8 @@ async def responses(request: Request):
 
         text = "".join(collected)
         calls = tools_emulation.parse_tool_calls(text) if tools else None
+        if tools and calls is None and _wants_retry(text):
+            text, calls = await _retry_malformed(svc, chat_req, text)
 
         if calls:
             items = _function_call_items(calls)

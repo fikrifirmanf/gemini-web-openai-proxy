@@ -245,6 +245,9 @@ real Responses-API `function_call` items, Codex executes them, and the loop clos
 through codex's `exec_command`). Caveats:
 
 - it is prompt-based — robustness depends on the model obeying the protocol;
+  the proxy mitigates Gemini Web's flaky JSON with a bare-key/comma repair pass
+  and a single corrective retry when a reply clearly *meant* to call tools but
+  arrived mangled (plain prose answers fall through untouched);
 - each Codex round trip is a fresh Gemini Web send (web sessions are stateless for us),
    so agent tasks consume multiple upstream turns and must respect the pacing interval;
 - disable with `GWOP_TOOL_EMULATION=0` (tools then fall back to plain chat answers).
