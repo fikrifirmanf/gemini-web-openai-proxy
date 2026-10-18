@@ -87,6 +87,18 @@ class StubService:
     def stop_recovery(self) -> None:
         return None
 
+    def acquire_instance_lock(self) -> None:
+        return None
+
+    def release_instance_lock(self) -> None:
+        return None
+
+    def cooldown_remaining(self) -> float:
+        return 0.0
+
+    async def send_upstream(self, chat, prompt: str, files=None):
+        return FakeOutput(text=self.text, thoughts=self.thoughts, images=list(self.generated))
+
     def recovery_info(self) -> dict:
         return {"enabled": True, "attempts": 0, "dormant": False}
 

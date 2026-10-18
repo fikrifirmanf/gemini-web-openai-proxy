@@ -94,6 +94,12 @@ class Settings:
     recovery_interval: float = 60.0   # seconds between recovery checks
     recovery_max_attempts: int = 5    # failed rounds in a row -> go dormant
 
+    # abuse-safety: keep upstream traffic cadence human-like and stop retry
+    # storms (the fastest way to get an account flagged)
+    send_interval: float = 1.5        # min seconds between upstream sends (jittered)
+    quota_cooldown: float = 300.0     # park new model traffic for Ns after an upstream 429
+    single_instance: bool = True      # flock data_dir; refuse a 2nd proxy on same cookies
+
     @classmethod
     def load(cls) -> "Settings":
         _load_dotenv()
@@ -120,6 +126,9 @@ class Settings:
             auto_recovery=_get_bool("AUTO_RECOVERY", True),
             recovery_interval=_get_float("RECOVERY_INTERVAL", 60.0),
             recovery_max_attempts=_get_int("RECOVERY_MAX_ATTEMPTS", 5),
+            send_interval=_get_float("SEND_INTERVAL", 1.5),
+            quota_cooldown=_get_float("QUOTA_COOLDOWN", 300.0),
+            single_instance=_get_bool("SINGLE_INSTANCE", True),
         )
         # gemini_webapi persists auto-refreshed __Secure-1PSIDTS cookies here.
         # Must be set before the gemini_webapi module is imported.

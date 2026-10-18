@@ -10,6 +10,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..errors import UpstreamError, map_exception
+from . import cooldown_guard
 from ..schemas import ChatCompletionRequest, make_usage, new_completion_id, unix_ts
 
 logger = logging.getLogger("gemini_openai_proxy.chat")
@@ -57,6 +58,9 @@ async def chat_completions(request: Request):
 
     try:
         await svc.start()
+        cooldown = cooldown_guard(svc.cooldown_remaining())
+        if cooldown is not None:
+            return cooldown
         _system, _history, _text, _last, _mobj, model_name = svc._split(req)
     except UpstreamError as exc:
         return _error_response(exc)

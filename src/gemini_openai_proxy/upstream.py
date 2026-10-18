@@ -22,6 +22,11 @@ import os
 import random
 import tempfile
 import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX (Windows): lock unsupported
+    fcntl = None  # type: ignore[assignment]
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +79,10 @@ class GeminiService:
         self._recovery_attempts = 0
         self._recovery_last = 0.0
         self._owns_rotation_session = False
+        self._last_send_at = 0.0
+        self._cooldown_until = 0.0
+        self._instance_lock_fd: Any = None
+        self._pace_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ state
 
@@ -101,6 +110,7 @@ class GeminiService:
         if account is not None:
             out["account_status"] = str(getattr(account, "name", int(account)))
         out["recovery"] = self.recovery_info()
+        out["quota_cooldown_seconds"] = round(self.cooldown_remaining())
         return out
 
     # ------------------------------------------------------------ recovery
@@ -562,8 +572,98 @@ class GeminiService:
 
     # ---------------------------------------------------------- send helpers
 
-    async def _send(self, chat: Any, prompt: str, files: list[Path]) -> Any:
+    async def _respect_send_interval(self) -> None:
+        """Jittered minimum gap between upstream sends so bursts look like typing.
+
+        The pace lock serializes the sleep+stamp so concurrent gate holders can't
+        fire two sends closer than ~send_interval apart.
+        """
+        interval = max(0.0, float(self.settings.send_interval))
+        async with self._pace_lock:
+            if interval <= 0:
+                self._last_send_at = time.monotonic()
+                return
+            target = self._last_send_at + interval * random.uniform(1.0, 1.5)
+            wait = target - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_send_at = time.monotonic()
+
+    # ------------------------------------------------------- instance guard
+
+    def acquire_instance_lock(self) -> None:
+        """Refuse a second proxy process on the same cookie set.
+
+        Two instances would let Google's cookie auto-refresh and ours race each
+        other (each rotation step can invalidate the other's TS), which is how
+        sessions die mysteriously mid-day. Non-blocking fcntl lock on the data dir.
+        """
+        if not getattr(self.settings, "single_instance", True) or fcntl is None:
+            return
+        path = self.settings.data_dir / "gemini_session.lock"
+        try:
+            self.settings.data_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise UpstreamError(503, f"Could not create data dir: {exc}") from exc
+        fd = open(path, "a+")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            fd.close()
+            raise UpstreamError(
+                409,
+                "Another gemini-web-openai-proxy instance is already running with this "
+                "data_dir/cookie set.",
+                hint=(
+                    "Stop the other process (or set GWOP_SINGLE_INSTANCE=0 to accept the "
+                    "risk of cookie-rotation races between the two instances)."
+                ),
+            ) from exc
+        with contextlib.suppress(OSError):
+            fd.seek(0)
+            fd.truncate()
+            fd.write(f"{os.getpid()}\n")
+            fd.flush()
+        self._instance_lock_fd = fd  # keep open for the lifetime of the process
+
+    def release_instance_lock(self) -> None:
+        fd = self._instance_lock_fd
+        if fd is not None:
+            with contextlib.suppress(Exception):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(Exception):
+                fd.close()
+            self._instance_lock_fd = None
+
+    def cooldown_remaining(self) -> float:
+        return max(0.0, self._cooldown_until - time.monotonic())
+
+    def _mark_rate_cool(self) -> None:
+        """After an upstream 429, stop generating new requests to Google for a while.
+
+        Retrying immediately against a dry quota / rate-limited IP is exactly the
+        traffic pattern that escalates a temporary block into an abuse flag.
+        """
+        if self.settings.quota_cooldown > 0:
+            self._cooldown_until = time.monotonic() + self.settings.quota_cooldown
+            logger.warning(
+                "upstream 429: parking new model traffic for ~%.0fs (GWOP_QUOTA_COOLDOWN)",
+                self.settings.quota_cooldown,
+            )
+
+    @staticmethod
+    def _on_send_mapped(mapped: UpstreamError, self: "GeminiService") -> None:
+        """Shared side effects of send failures (401 → rebuild soon, 429 → cooldown)."""
+        if mapped.status == 401:
+            self.ready = False  # next request will re-init with fresh cookies
+            self.kick_recovery()  # self-heal in the background immediately
+        elif mapped.status == 429:
+            self._mark_rate_cool()
+
+    async def send_upstream(self, chat: Any, prompt: str, files: list[Path]) -> Any:
+        """Disciplined one-shot send used by the images endpoint (gated + paced)."""
         async with self._gate:
+            await self._respect_send_interval()
             try:
                 return await chat.send_message(
                     prompt,
@@ -572,14 +672,27 @@ class GeminiService:
                 )
             except Exception as exc:  # noqa: BLE001
                 mapped = map_exception(exc)
-                if mapped.status == 401:
-                    self.ready = False  # next request will re-init with fresh cookies
-                    self.kick_recovery()  # self-heal in the background immediately
+                self._on_send_mapped(mapped, self)
+                raise mapped from exc
+
+    async def _send(self, chat: Any, prompt: str, files: list[Path]) -> Any:
+        async with self._gate:
+            await self._respect_send_interval()
+            try:
+                return await chat.send_message(
+                    prompt,
+                    files=files or None,
+                    temporary=self.settings.temporary_chats,
+                )
+            except Exception as exc:  # noqa: BLE001
+                mapped = map_exception(exc)
+                self._on_send_mapped(mapped, self)
                 raise mapped from exc
 
     def _send_raw(self, chat: Any, prompt: str, files: list[Path]) -> AsyncGenerator[Any, None]:
         async def _gen():
             async with self._gate:
+                await self._respect_send_interval()
                 try:
                     async for chunk in chat.send_message_stream(
                         prompt,
@@ -589,9 +702,7 @@ class GeminiService:
                         yield chunk
                 except Exception as exc:  # noqa: BLE001
                     mapped = map_exception(exc)
-                    if mapped.status == 401:
-                        self.ready = False  # next request will re-init
-                        self.kick_recovery()
+                    self._on_send_mapped(mapped, self)
                     raise mapped from exc
 
         return _gen()

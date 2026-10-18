@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from ..content import MediaCollector
 from ..errors import UpstreamError, map_exception
+from . import cooldown_guard
 from ..schemas import ImagesRequest, ImagesResponse, ImageData
 
 logger = logging.getLogger("gemini_openai_proxy.images")
@@ -33,6 +34,9 @@ async def images_generations(request: Request):
 
     try:
         await svc.start()
+        cooldown = cooldown_guard(svc.cooldown_remaining())
+        if cooldown is not None:
+            return cooldown
         model_obj, _display = svc.resolve_model(req.model)
         reference_urls = list(getattr(req, "image", None) or [])
 
@@ -52,11 +56,7 @@ async def images_generations(request: Request):
 
         chat = svc.client.start_chat(model=model_obj)
         try:
-            output = await chat.send_message(
-                prompt,
-                files=files or None,
-                temporary=svc.settings.temporary_chats,
-            )
+            output = await svc.send_upstream(chat, prompt, files)
         finally:
             svc._cleanup_files(files)
 

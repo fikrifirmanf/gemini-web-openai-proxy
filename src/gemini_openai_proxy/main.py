@@ -34,6 +34,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.upstream_proxy or "-",
         )
         try:
+            svc.acquire_instance_lock()  # abort startup on a 2nd proxy with the same cookies
+        except UpstreamError as exc:
+            logger.critical("startup aborted: %s — %s", exc.message, exc.hint or "")
+            raise
+        try:
             await svc.start()
             banner = svc.banner()
             logger.info("upstream ready. models: %s", [m["id"] for m in banner["models"]])
@@ -52,6 +57,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         svc.start_recovery()  # background self-healing; also covers init failed at boot
         yield
         svc.stop_recovery()
+        svc.release_instance_lock()
         await svc.stop()
 
     app = FastAPI(

@@ -132,6 +132,9 @@ provider = "OpenAI", base URL as above, API key = anything.
 | `GWOP_AUTO_RECOVERY` | `1` | self-healing: when Google reports the session unauthenticated, rotate `__Secure-1PSIDTS` from the long-lived 1PSID and rebuild the client in the background |
 | `GWOP_RECOVERY_INTERVAL` | `60` | seconds between recovery checks |
 | `GWOP_RECOVERY_MAX_ATTEMPTS` | `5` | consecutive failed rounds before recovery goes dormant (until `POST /admin/reinit` re-arms it) |
+| `GWOP_SEND_INTERVAL` | `1.5` | min jittered gap in seconds between upstream sends (burst pacing) |
+| `GWOP_QUOTA_COOLDOWN` | `300` | seconds new requests are locally 429'd (`Retry-After`) after an upstream 429 |
+| `GWOP_SINGLE_INSTANCE` | `1` | flock-protect the data dir; a 2nd proxy process aborts instead of racing cookie rotation |
 
 Precedence: `cookies.txt` **>** raw header **>** 1PSID pair. You only need one.
 
@@ -178,6 +181,35 @@ state:
 ℹ️ Because the healthy-session refresh runs every ~10 min from within the proxy, the
 usual failure mode ("Chrome rotated the session under the proxy's feet") is rare — it
 mostly hits when the proxy was stopped/offline while Chrome kept rotating.
+
+## Being treated like a human (abuse safety)
+
+Google flags accounts on *traffic shape*, not on the proxy itself. The proxy ships the
+guard-rails below, on by default:
+
+| Guard | Default | What it does |
+| --- | --- | --- |
+| Send pacing | `GWOP_SEND_INTERVAL=1.5`s (jittered ×1.0–1.5) | minimum real-time gap between upstream sends, regardless of how hard clients parallelize |
+| Concurrency cap | `GWOP_MAX_CONCURRENCY=3` | simultaneous upstream calls, including image generation (which used to be ungated) |
+| Quota cooldown | `GWOP_QUOTA_COOLDOWN=300`s | after an upstream 429, new model traffic gets a local 429 + `Retry-After` instead of continuing to poke Google with a dry quota |
+| Single instance | `GWOP_SINGLE_INSTANCE=1` | refuses a 2nd proxy on the same `data_dir` (concurrent cookie-rotation races kill sessions and look ugly to Google) |
+| Bounded self-heal | ≥60 s apart, ≤ `GWOP_RECOVERY_MAX_ATTEMPTS` | the recovery loop never hammers `/RotateCookies` |
+| Temporary chats | `GWOP_TEMPORARY_CHATS=1` | requests never land in Gemini web history |
+
+Extra posture advice:
+
+- **Run it for yourself only.** Bind `GWOP_HOST=127.0.0.1`, or set `GWOP_API_KEY` the
+  moment you bind anything wider — an open relay on your account is the single worst
+  abuse-safety mistake.
+- **Keep one egress IP** (`GWOP_HTTP_PROXY` for steadiness if your home IP churns);
+  rotating hosts/VPN hops are a strong automation signal.
+- **Watch your abuse status** in `/admin/status` (`Account abuse status: Clean`) and the
+  per-model quota lines; stop when credits run dry instead of hot-retrying.
+- **Volume discipline**: a chat CLI for a human stays far below the per-day web quota; if
+  you wire it into bulk automation (cron loops, bulk pipelines), slow it down on purpose.
+- Be aware automating the Gemini web app is itself against Google's ToS — account-level
+  risk is yours; the guards above minimize the *pattern* that triggers flags, not the
+  policy violation.
 
 ## How it maps an OpenAI conversation onto the web app
 
