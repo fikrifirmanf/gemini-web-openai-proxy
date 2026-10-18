@@ -17,6 +17,9 @@ import base64 as b64lib
 import contextlib
 import hashlib
 import json
+import logging
+import os
+import random
 import tempfile
 import time
 from collections import OrderedDict
@@ -25,13 +28,19 @@ from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import httpx
-from gemini_webapi import GeminiClient
+from curl_cffi import CurlFollow, CurlHttpVersion
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from gemini_webapi import AuthError, GeminiClient
+from gemini_webapi.constants import BROWSER_TYPE
 from gemini_webapi.types import AvailableModel, Image
+from gemini_webapi.utils.rotate_1psidts import rotate_1psidts
 
 from .config import Settings
 from .content import MediaCollector, build_turn_text, flatten_single_prompt, make_fallback_prompt, media_urls_of
 from .cookies import GeminiCookies, resolve_cookies
 from .errors import UpstreamError, map_exception
+
+logger = logging.getLogger("gemini_openai_proxy.upstream")
 
 _ROLE_LABEL = {"user": "User", "assistant": "Assistant", "tool": "Assistant"}
 _SYSTEM_ROLES = {"system", "developer"}
@@ -60,6 +69,11 @@ class GeminiService:
         self.last_init_error = ""
         self.cookie_source = ""
         self._http: httpx.AsyncClient | None = None
+        self._recovery_task: asyncio.Task | None = None
+        self._recovery_kick: asyncio.Task | None = None
+        self._recovery_attempts = 0
+        self._recovery_last = 0.0
+        self._owns_rotation_session = False
 
     # ------------------------------------------------------------------ state
 
@@ -86,7 +100,202 @@ class GeminiService:
         }
         if account is not None:
             out["account_status"] = str(getattr(account, "name", int(account)))
+        out["recovery"] = self.recovery_info()
         return out
+
+    # ------------------------------------------------------------ recovery
+
+    def recovery_info(self) -> dict[str, Any]:
+        max_attempts = max(1, self.settings.recovery_max_attempts)
+        return {
+            "enabled": bool(self.settings.auto_recovery and self.settings.has_any_cookie),
+            "attempts": self._recovery_attempts,
+            "dormant": self._recovery_attempts >= max_attempts,
+        }
+
+    def _account_status_name(self) -> str | None:
+        account = getattr(self.client, "account_status", None) if self.client else None
+        if account is None:
+            return None
+        return str(getattr(account, "name", account))
+
+    def _account_ok(self) -> bool:
+        return self._account_status_name() == "AVAILABLE"
+
+    def start_recovery(self) -> None:
+        """Spawn the background self-healing loop (idempotent, no-op when disabled)."""
+        if not (self.settings.auto_recovery and self.settings.has_any_cookie):
+            return
+        if self._recovery_task is None or self._recovery_task.done():
+            self._recovery_task = asyncio.create_task(self._recovery_loop())
+
+    def stop_recovery(self) -> None:
+        if self._recovery_task:
+            self._recovery_task.cancel()
+            self._recovery_task = None
+        if self._recovery_kick:
+            self._recovery_kick.cancel()
+            self._recovery_kick = None
+
+    def kick_recovery(self) -> None:
+        """One recovery attempt soon; called when a request hits an auth error.
+
+        Debounced into a single scheduled round while one is already pending.
+        """
+        if not (self.settings.auto_recovery and self.settings.has_any_cookie):
+            return
+
+        async def _kick() -> None:
+            try:
+                await asyncio.sleep(3.0)  # let concurrent 401s pile up, then heal once
+                await self.maybe_recover()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("recovery kick aborted: %r", exc)
+            finally:
+                self._recovery_kick = None
+
+        if self._recovery_kick is not None and not self._recovery_kick.done():
+            return
+        try:
+            self._recovery_kick = asyncio.get_running_loop().create_task(_kick())
+        except RuntimeError:  # no loop: e.g. called from a sync test context
+            pass
+
+    async def maybe_recover(self) -> bool:
+        """One bounded attempt to authenticate an unauthenticated session.
+
+        Returns True if the upstream is healthy (or became healthy now). Rounds are
+        debounced (>=60s apart); after `recovery_max_attempts` consecutive failures
+        the circuit opens until a manual `/admin/reinit` or a process restart.
+        """
+        now = time.monotonic()
+        if now - self._recovery_last < 60.0 and self._recovery_attempts > 0:
+            return self.ready and self._account_ok()
+        self._recovery_last = now
+
+        if self.ready and self._account_ok():
+            self._recovery_attempts = 0
+            return True
+
+        max_attempts = max(1, self.settings.recovery_max_attempts)
+        if self._recovery_attempts >= max_attempts:
+            return False  # dormant: stays quiet until reinit() re-arms it
+
+        self._recovery_attempts += 1
+        try:
+            ok = await self._recovery_round()
+        except UpstreamError as exc:
+            logger.warning("auto-recovery round %s failed: %s", self._recovery_attempts, exc.message)
+            if exc.hint:
+                logger.warning("auto-recovery hint: %s", exc.hint)
+            ok = False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auto-recovery round %s failed: %r", self._recovery_attempts, exc)
+            ok = False
+
+        if ok:
+            logger.info("auto-recovery: session restored after %s attempt(s)", self._recovery_attempts)
+            self._recovery_attempts = 0
+        elif self._recovery_attempts >= max_attempts:
+            logger.critical(
+                "auto-recovery dormant after %s failed rounds. Rotate yourself: re-copy "
+                "fresh __Secure-1PSID/__Secure-1PSIDTS into .env, then POST /admin/reinit "
+                "(/reinit in scripts/chat.py).",
+                self._recovery_attempts,
+            )
+        return bool(ok and self.ready and self._account_ok())
+
+    async def _recovery_round(self) -> bool:
+        """Rotate __Secure-1PSIDTS from the long-lived 1PSID, then rebuild + verify."""
+        cookies = self._resolve_cookies()  # also validates a cookie source exists
+        self._drop_cookie_cache(cookies)   # force a real network rotation below
+
+        curl_session = self._rotation_session(cookies)
+        try:
+            new_1psidts = await rotate_1psidts(
+                curl_session, verbose=self.settings.log_level == "DEBUG"
+            )
+        except AuthError:
+            raise UpstreamError(
+                401,
+                "Google refused to rotate cookies for the stored session (401). Rotation is "
+                "only granted to sessions Google still trusts — a copied pair that Google "
+                "has already rotated away needs fresh values.",
+                hint=(
+                    "Re-copy fresh __Secure-1PSID + __Secure-1PSIDTS into .env, then "
+                    "POST /admin/reinit. To avoid this state, let the proxy's own "
+                    "auto-refresh (every ~10 min while healthy) do the rotating and keep "
+                    "the cookies.txt source stable."
+                ),
+            ) from None
+        finally:
+            if self._owns_rotation_session:
+                with contextlib.suppress(Exception):
+                    await curl_session.close()
+
+        if not new_1psidts:
+            raise UpstreamError(
+                502,
+                "Cookie rotation succeeded but minted no __Secure-1PSIDTS.",
+                hint="Google may have invalidated the session; re-copy fresh cookies and reinit.",
+            )
+
+        async with self._init_lock:
+            if self.client:
+                with contextlib.suppress(Exception):
+                    await self.client.close()
+                self.client = None
+            self.ready = False
+            await self._start_inner()
+        return self.ready and self._account_ok()
+
+    def _rotation_session(self, cookies: GeminiCookies):
+        """Reuse the live TLS session when possible, else build a browser-fingerprinted one."""
+        try:
+            live = self.client._live_client if self.client else None  # noqa: SLF001
+        except Exception:  # noqa: BLE001 - property raises when the client is down
+            live = None
+        if live is not None:
+            self._owns_rotation_session = False
+            return live
+
+        session = CurlAsyncSession(  # same fingerprint the lib uses for init
+            impersonate=BROWSER_TYPE,
+            proxy=self.settings.upstream_proxy or None,
+            allow_redirects=CurlFollow.SAFE,
+            http_version=CurlHttpVersion.NONE,
+            verify=True,
+        )
+        jar = {"__Secure-1PSID": cookies.secure_1psid, "__Secure-1PSIDTS": cookies.secure_1psidts or ""}
+        if cookies.extra:
+            jar.update(cookies.extra)
+        for name, value in jar.items():
+            if value:
+                session.cookies.set(name, value, domain=".google.com", path="/", secure=True)
+        self._owns_rotation_session = True
+        return session
+
+    @staticmethod
+    def _drop_cookie_cache(cookies: GeminiCookies) -> None:
+        """Remove the cached cookie entry so rotation can't skip via the <60s rule.
+
+        Mirrors gemini_webapi's cache layout: .cached_cookies_<1PSID>.json.
+        """
+        cache_dir = Path(os.environ.get("GEMINI_COOKIE_PATH") or (Path("data").resolve() / "gemini_cookies"))
+        with contextlib.suppress(OSError):
+            (cache_dir / f".cached_cookies_{cookies.secure_1psid}.json").unlink()
+
+    async def _recovery_loop(self) -> None:
+        interval = max(30.0, float(self.settings.recovery_interval))
+        logger.info("auto-recovery loop started (checks every ~%ss)", interval)
+        try:
+            while True:
+                await asyncio.sleep(interval + random.uniform(0.0, interval * 0.25))
+                await self.maybe_recover()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("auto-recovery loop crashed: %r — restart the proxy to re-arm", exc)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -144,6 +353,8 @@ class GeminiService:
         Re-reads .env/env first, so users can refresh cookies without restarting.
         """
         self.settings = Settings.load()  # picks up edited cookie values
+        self._recovery_attempts = 0  # manual action re-arms the circuit breaker
+        self._recovery_last = 0.0
         async with self._init_lock:
             if self.client:
                 with contextlib.suppress(Exception):
@@ -363,6 +574,7 @@ class GeminiService:
                 mapped = map_exception(exc)
                 if mapped.status == 401:
                     self.ready = False  # next request will re-init with fresh cookies
+                    self.kick_recovery()  # self-heal in the background immediately
                 raise mapped from exc
 
     def _send_raw(self, chat: Any, prompt: str, files: list[Path]) -> AsyncGenerator[Any, None]:
@@ -379,6 +591,7 @@ class GeminiService:
                     mapped = map_exception(exc)
                     if mapped.status == 401:
                         self.ready = False  # next request will re-init
+                        self.kick_recovery()
                     raise mapped from exc
 
         return _gen()

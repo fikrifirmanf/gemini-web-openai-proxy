@@ -41,14 +41,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if account and account != "AVAILABLE":
                 logger.warning(
                     "Google reports account status %s — anonymous Gemini only. "
-                    "Provide valid __Secure-1PSID/__Secure-1PSIDTS cookies for full models.",
+                    "Auto-recovery will keep trying cookie rotation; if it stays "
+                    "unauthenticated, re-copy fresh __Secure-1PSID/__Secure-1PSIDTS cookies.",
                     account,
                 )
         except UpstreamError as exc:
             svc.last_init_error = exc.message
             logger.critical("upstream init failed (%s): %s — %s", exc.status, exc.message, exc.hint or "")
             logger.critical("requests will keep retrying init; fix cookies/API key usage and reinit via POST /admin/reinit")
+        svc.start_recovery()  # background self-healing; also covers init failed at boot
         yield
+        svc.stop_recovery()
         await svc.stop()
 
     app = FastAPI(

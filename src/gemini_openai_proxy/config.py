@@ -88,6 +88,12 @@ class Settings:
     include_thoughts: bool = True # surface model thoughts as reasoning_content
     max_image_bytes: int = 20 * 1024 * 1024
 
+    # self-healing: when Google reports the session UNAUTHENTICATED, rotate
+    # __Secure-1PSIDTS from the long-lived 1PSID and rebuild the client
+    auto_recovery: bool = True
+    recovery_interval: float = 60.0   # seconds between recovery checks
+    recovery_max_attempts: int = 5    # failed rounds in a row -> go dormant
+
     @classmethod
     def load(cls) -> "Settings":
         _load_dotenv()
@@ -111,6 +117,9 @@ class Settings:
             strict_model=_get_bool("STRICT_MODEL", False),
             images_in_chat=_get_bool("IMAGES_IN_CHAT", True),
             include_thoughts=_get_bool("INCLUDE_THOUGHTS", True),
+            auto_recovery=_get_bool("AUTO_RECOVERY", True),
+            recovery_interval=_get_float("RECOVERY_INTERVAL", 60.0),
+            recovery_max_attempts=_get_int("RECOVERY_MAX_ATTEMPTS", 5),
         )
         # gemini_webapi persists auto-refreshed __Secure-1PSIDTS cookies here.
         # Must be set before the gemini_webapi module is imported.

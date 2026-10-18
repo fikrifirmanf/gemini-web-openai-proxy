@@ -129,6 +129,9 @@ provider = "OpenAI", base URL as above, API key = anything.
 | `GWOP_INCLUDE_THOUGHTS` | `1` | `0` hides `reasoning_content` |
 | `GWOP_REQUEST_TIMEOUT` | `300` | per upstream call |
 | `GWOP_INIT_TIMEOUT` | `120` | session handshake |
+| `GWOP_AUTO_RECOVERY` | `1` | self-healing: when Google reports the session unauthenticated, rotate `__Secure-1PSIDTS` from the long-lived 1PSID and rebuild the client in the background |
+| `GWOP_RECOVERY_INTERVAL` | `60` | seconds between recovery checks |
+| `GWOP_RECOVERY_MAX_ATTEMPTS` | `5` | consecutive failed rounds before recovery goes dormant (until `POST /admin/reinit` re-arms it) |
 
 Precedence: `cookies.txt` **>** raw header **>** 1PSID pair. You only need one.
 
@@ -141,8 +144,40 @@ Precedence: `cookies.txt` **>** raw header **>** 1PSID pair. You only need one.
 | `GET /v1/models` | models your account has (live-discovered) |
 | `POST /v1/chat/completions` | chat; `stream=true` gives SSE |
 | `POST /v1/images/generations` | prompt in, `b64_json` out; reference images accepted via an extra `"image"` field (e.g. OpenAI SDK `extra_body={"image": [...]}`) |
-| `POST /admin/reinit` | force a fresh upstream session; **re-reads `.env`** first (refresh cookies without restarting) |
-| `GET /admin/status` | banner + quota/usage snapshot when the account exposes it |
+| `POST /admin/reinit` | force a fresh upstream session; **re-reads `.env`** first (refresh cookies without restarting); re-arms the recovery breaker |
+| `GET /admin/status` | banner + quota/usage snapshot when the account exposes it (includes the `recovery` state) |
+
+## Self-healing cookie rotation
+
+Google binds Gemini web sessions to a small set of rotating cookies:
+
+- `__Secure-1PSID` — long-lived; identifies your account
+- `__Secure-1PSIDTS` — **short-lived; Google rotates it server-side within hours** and
+  invalidates the previous value (this is what most often makes a copied session go
+  "unauthenticated")
+
+The upstream library already keeps a *healthy* session alive (background rotation every
+10 min + activity heartbeat). What this proxy adds is a recovery loop for the *broken*
+state:
+
+1. A background loop checks every `GWOP_RECOVERY_INTERVAL` seconds (and any request that
+   hits a 401 triggers an immediate attempt).
+2. When the session is unauthenticated, it drops the stale cookie cache entry, asks
+   Google's `RotateCookies` endpoint for a fresh `__Secure-1PSIDTS` using your
+   `__Secure-1PSID` (same browser TLS fingerprint as sign-in), rebuilds the client, and
+   verifies the account is fully authenticated again.
+3. **Google only grants rotation to sessions it still trusts.** A pair whose TS was
+   already rotated away (e.g. your browser invalidated it right after you copied it) gets
+   a 401 and cannot self-heal — the loop reports exactly that and stops once its attempt
+   budget is gone; the fix is to re-copy fresh values into `.env` and `POST /admin/reinit`
+   (which re-reads `.env` immediately, no restart).
+4. It never hammers Google: rounds are debounced to >=60 s apart and stop (dormant, logged
+   clearly, visible in `/admin/status`) after `GWOP_RECOVERY_MAX_ATTEMPTS` consecutive
+   failures. A successful round or manual `POST /admin/reinit` re-arms it.
+
+ℹ️ Because the healthy-session refresh runs every ~10 min from within the proxy, the
+usual failure mode ("Chrome rotated the session under the proxy's feet") is rare — it
+mostly hits when the proxy was stopped/offline while Chrome kept rotating.
 
 ## How it maps an OpenAI conversation onto the web app
 
@@ -168,7 +203,7 @@ history.
 | `401 upstream_auth_error` | cookies expired / logout | re-copy the pair; `POST /admin/reinit` |
 | `429 upstream_rate_limited` | daily quota / IP block from parallel calls | wait, lower `GWOP_MAX_CONCURRENCY` |
 | `502 … did not return any images` | prompt phrased as "search for images" | ask it to *generate* an image |
-| models list only shows `gemini-flash-lite` | session is unauthenticated (anonymous tier) | **Chromium rotates `__Secure-1PSIDTS` within hours**: re-copy fresh `__Secure-1PSID` + `__Secure-1PSIDTS` values into `.env`, clear `GWOP_DATA_DIR/gemini_cookies`, then `POST /admin/reinit` (it now re-reads `.env` — no restart needed) or run `/reinit` in `scripts/chat.py` |
+| models list only shows `gemini-flash-lite` | session is unauthenticated (anonymous tier) | auto-recovery will attempt `__Secure-1PSIDTS` rotation in the background; **Google only rotates a session it still trusts** — if the copied pair has already been rotated away, re-copy fresh values into `.env` and `POST /admin/reinit` (re-reads `.env`; no restart needed) |
 | `503 No Gemini cookies found` | env vars missing/typo'd | see message; use exactly the cookie **values** (not the names) |
 | cookies keep expiring although you re-copy them | an interactive Chrome session keeps rotating `__Secure-1PSIDTS` under the proxy's feet | log in to gemini.google.com in a **separate private/incognito window**, export the cookies, close that window so nothing else rotates the session; Firefox cookies also rotate far less (browser-cookie3 path) |
 | Streaming clients hang | a proxy in front strips SSE? | server sets `X-Accel-Buffering: no`; bypass intermediate caching proxies |

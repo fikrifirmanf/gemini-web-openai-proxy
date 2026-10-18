@@ -81,6 +81,15 @@ class StubService:
     async def reinit(self) -> dict:
         return {"service": "stub", "ready": self.ready, "models": []}
 
+    def start_recovery(self) -> None:
+        return None
+
+    def stop_recovery(self) -> None:
+        return None
+
+    def recovery_info(self) -> dict:
+        return {"enabled": True, "attempts": 0, "dormant": False}
+
     # introspection --------------------------------------------------------
     def banner(self) -> dict:
         return {
