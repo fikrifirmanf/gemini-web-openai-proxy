@@ -28,6 +28,6 @@ def cooldown_guard(cooldown_seconds: float) -> JSONResponse | None:
     )
 
 
-from . import chat, images, meta  # noqa: E402,F401
+from . import chat, images, meta, responses  # noqa: E402,F401
 
-__all__ = ["chat", "images", "meta", "cooldown_guard"]
+__all__ = ["chat", "images", "meta", "responses", "cooldown_guard"]

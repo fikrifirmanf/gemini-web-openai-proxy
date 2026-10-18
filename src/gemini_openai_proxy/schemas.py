@@ -65,6 +65,87 @@ def make_usage(prompt_chars: int, completion_chars: int) -> dict[str, int]:
     }
 
 
+class ResponsesRequest(BaseModel):
+    """OpenAI **Responses API** (`POST /v1/responses`) — required by Codex ≥0.145.
+
+    Only the subset Codex actually sends is modelled; unknown fields are allowed
+    and ignored (tools currently have no Gemini Web counterpart).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str = "default"
+    input: str | list[Any] = ""
+    instructions: str | None = None
+    stream: bool = False
+    reasoning: dict[str, Any] | None = None
+
+    @property
+    def effort(self) -> str | None:
+        effort = (self.reasoning or {}).get("effort")
+        return str(effort) if effort else None
+
+    def to_chat_request(self) -> ChatCompletionRequest:
+        """Translate Responses-API items into chat-completions messages."""
+        system = (self.instructions or "").strip()
+        messages: list[dict[str, Any]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+
+        if isinstance(self.input, str):
+            messages.append({"role": "user", "content": self.input})
+        else:
+            for item in self.input:
+                if not isinstance(item, dict):
+                    messages.append({"role": "user", "content": str(item)})
+                    continue
+                kind = item.get("type", "message")
+                if kind == "message":
+                    role = str(item.get("role", "user"))
+                    messages.append({"role": role, "content": _flatten_content(item.get("content"))})
+                elif kind == "function_call_output":
+                    name = str(item.get("call_id") or "tool_call")
+                    messages.append({
+                        "role": "tool",
+                        "content": f"[tool result for {name}]\n{_flatten_content(item.get('output'))}",
+                    })
+                # function_call / reasoning / item_reference / mcp_* -> no Gemini
+                # Web equivalent: silently skipped (the model cannot call tools).
+
+        messages = [m for m in messages if str(m.get("content") or "").strip() or m["role"] == "system"]
+        if not messages:
+            messages.append({"role": "user", "content": "(no content)"})
+        return ChatCompletionRequest(
+            model=self.model or "default",
+            messages=messages,
+            stream=self.stream,
+            reasoning_effort=self.effort,
+        )
+
+
+def _flatten_content(content: Any) -> str:
+    """Responses-API content is a string or a parts list; keep only the text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return str(content.get("text") or content.get("output") or "")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("output") or ""))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def new_response_id() -> str:
+    return "resp_" + uuid.uuid4().hex
+
+
 class ModelObject(BaseModel):
     id: str
     object: Literal["model"] = "model"

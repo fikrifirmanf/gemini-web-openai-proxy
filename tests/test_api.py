@@ -105,3 +105,35 @@ def test_bearer_auth_required(monkeypatch):  # noqa: F811
 def test_admin_status(client):  # noqa: F811
     body = client.get("/admin/status").json()
     assert body["service"] == "gemini-openai-proxy"
+
+
+def test_responses_endpoint_non_stream(client):
+    payload = {
+        "model": "gemini-pro",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        ],
+        "instructions": "Be terse.",
+        "reasoning": {"effort": "high"},
+    }
+    resp = client.post("/v1/responses", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "response"
+    assert body["status"] == "completed"
+    assert body["model"] == "gemini-pro"
+    assert body["output"][0]["type"] == "message"
+    assert "output_text" in body["output"][0]["content"][0]["type"]
+    assert body["usage"]["total_tokens"] > 0
+
+
+def test_responses_endpoint_stream_events(client):
+    payload = {"model": "gemini-flash", "input": "hi", "stream": True}
+    events = [
+        line.split(": ", 1)[1]  # event name
+        for line in client.post("/v1/responses", json=payload).text.splitlines()
+        if line.startswith("event: ")
+    ]
+    assert events[0] == "response.created"
+    assert "response.output_text.delta" in events
+    assert events[-1] == "response.completed"

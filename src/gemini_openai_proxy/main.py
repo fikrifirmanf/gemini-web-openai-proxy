@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings
 from .errors import UpstreamError
-from .routes import chat, images, meta
+from .routes import chat, images, meta, responses
 from .upstream import GeminiService
 
 logger = logging.getLogger("gemini_openai_proxy")
@@ -72,6 +72,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(meta.router)
     app.include_router(chat.router)
     app.include_router(images.router)
+    app.include_router(responses.router)
 
     @app.middleware("http")
     async def guard(request: Request, call_next):

@@ -146,6 +146,7 @@ Precedence: `cookies.txt` **>** raw header **>** 1PSID pair. You only need one.
 | `GET /readyz` | readiness: 200 when the web session is live, 503 with a reason otherwise |
 | `GET /v1/models` | models your account has (live-discovered) |
 | `POST /v1/chat/completions` | chat; `stream=true` gives SSE |
+| `POST /v1/responses` | OpenAI **Responses API** (Codex ≥0.145 talks this); instructions + input items → Gemini Web; chat semantics |
 | `POST /v1/images/generations` | prompt in, `b64_json` out; reference images accepted via an extra `"image"` field (e.g. OpenAI SDK `extra_body={"image": [...]}`) |
 | `POST /admin/reinit` | force a fresh upstream session; **re-reads `.env`** first (refresh cookies without restarting); re-arms the recovery breaker |
 | `GET /admin/status` | banner + quota/usage snapshot when the account exposes it (includes the `recovery` state) |
@@ -210,6 +211,38 @@ Extra posture advice:
 - Be aware automating the Gemini web app is itself against Google's ToS — account-level
   risk is yours; the guards above minimize the *pattern* that triggers flags, not the
   policy violation.
+
+## Using it with OpenAI Codex CLI
+
+Codex ≥0.145 dropped support for chat-completions providers — it requires the OpenAI
+**Responses API**, so the proxy implements `POST /v1/responses` (translate input items /
+instructions into Gemini Web turns; stream as `response.*` events).
+
+`~/.codex/config.toml`:
+
+```toml
+[model_providers.gemini-web]
+name = "Gemini Web (local proxy)"
+base_url = "http://127.0.0.1:8011/v1"
+wire_api = "responses"
+```
+
+plus one profile file per model, e.g. `~/.codex/gemini-flash.config.toml`:
+
+```toml
+model = "gemini-flash"
+model_provider = "gemini-web"
+```
+
+Then: `codex --profile gemini-flash` (also `gemini-flash-lite` / `gemini-pro` /
+`gemini-argon`).
+
+**Limitations**: turns work as chat (including `reasoning.effort`), but Codex's agent
+actions need the model to emit `function_call` items, which Gemini Web cannot produce.
+When the model "runs a command" it is **hallucinating the output as text** — nothing is
+executed. Don't trust/rely on Codex+Gemini-Web for real agentic tasks; grep the transcript
+for `function_call` if in doubt. Real tool-call emulation is a possible (fragile) future
+feature.
 
 ## How it maps an OpenAI conversation onto the web app
 
