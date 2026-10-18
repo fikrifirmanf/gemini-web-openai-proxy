@@ -85,9 +85,15 @@ class ResponsesRequest(BaseModel):
         effort = (self.reasoning or {}).get("effort")
         return str(effort) if effort else None
 
-    def to_chat_request(self) -> ChatCompletionRequest:
-        """Translate Responses-API items into chat-completions messages."""
+    def to_chat_request(self, extra_system: str = "") -> ChatCompletionRequest:
+        """Translate Responses-API items into chat-completions messages.
+
+        `extra_system` carries the emulated tool-calling protocol when the
+        request declares tools (see tools_emulation.py).
+        """
         system = (self.instructions or "").strip()
+        if extra_system.strip():
+            system = f"{system}\n\n{extra_system}".strip() if system else extra_system.strip()
         messages: list[dict[str, Any]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -103,14 +109,19 @@ class ResponsesRequest(BaseModel):
                 if kind == "message":
                     role = str(item.get("role", "user"))
                     messages.append({"role": role, "content": _flatten_content(item.get("content"))})
+                elif kind == "function_call":
+                    name = str(item.get("name") or "tool")
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"[Tool request] {name} {item.get('arguments') or ''}",
+                    })
                 elif kind == "function_call_output":
                     name = str(item.get("call_id") or "tool_call")
                     messages.append({
                         "role": "tool",
                         "content": f"[tool result for {name}]\n{_flatten_content(item.get('output'))}",
                     })
-                # function_call / reasoning / item_reference / mcp_* -> no Gemini
-                # Web equivalent: silently skipped (the model cannot call tools).
+                # reasoning / item_reference / mcp_* -> no Gemini Web equivalent.
 
         messages = [m for m in messages if str(m.get("content") or "").strip() or m["role"] == "system"]
         if not messages:

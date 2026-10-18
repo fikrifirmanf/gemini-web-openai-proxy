@@ -100,6 +100,10 @@ class Settings:
     quota_cooldown: float = 300.0     # park new model traffic for Ns after an upstream 429
     single_instance: bool = True      # flock data_dir; refuse a 2nd proxy on same cookies
 
+    # experimental: emulate OpenAI tool-calling for Codex by prompting Gemini to
+    # emit a strict JSON block, parsing it, and returning real function_call items
+    tool_emulation: bool = True
+
     @classmethod
     def load(cls) -> "Settings":
         _load_dotenv()
@@ -129,6 +133,7 @@ class Settings:
             send_interval=_get_float("SEND_INTERVAL", 1.5),
             quota_cooldown=_get_float("QUOTA_COOLDOWN", 300.0),
             single_instance=_get_bool("SINGLE_INSTANCE", True),
+            tool_emulation=_get_bool("TOOL_EMULATION", True),
         )
         # gemini_webapi persists auto-refreshed __Secure-1PSIDTS cookies here.
         # Must be set before the gemini_webapi module is imported.

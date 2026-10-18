@@ -237,12 +237,17 @@ model_provider = "gemini-web"
 Then: `codex --profile gemini-flash` (also `gemini-flash-lite` / `gemini-pro` /
 `gemini-argon`).
 
-**Limitations**: turns work as chat (including `reasoning.effort`), but Codex's agent
-actions need the model to emit `function_call` items, which Gemini Web cannot produce.
-When the model "runs a command" it is **hallucinating the output as text** — nothing is
-executed. Don't trust/rely on Codex+Gemini-Web for real agentic tasks; grep the transcript
-for `function_call` if in doubt. Real tool-call emulation is a possible (fragile) future
-feature.
+**Tool calling (emulated, works)**: when a request declares function tools, the proxy
+injects a protocol instructing Gemini to answer with a strict
+`{"tool_calls": [{"name": …, "arguments": {…}}]}` JSON object; the proxy lifts that into
+real Responses-API `function_call` items, Codex executes them, and the loop closes with
+`function_call_output` turns. Verified live end-to-end (multi-round file create/append/cat
+through codex's `exec_command`). Caveats:
+
+- it is prompt-based — robustness depends on the model obeying the protocol;
+- each Codex round trip is a fresh Gemini Web send (web sessions are stateless for us),
+   so agent tasks consume multiple upstream turns and must respect the pacing interval;
+- disable with `GWOP_TOOL_EMULATION=0` (tools then fall back to plain chat answers).
 
 ## How it maps an OpenAI conversation onto the web app
 

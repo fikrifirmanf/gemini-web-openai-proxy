@@ -41,13 +41,13 @@ from gemini_webapi.types import AvailableModel, Image
 from gemini_webapi.utils.rotate_1psidts import rotate_1psidts
 
 from .config import Settings
-from .content import MediaCollector, build_turn_text, flatten_single_prompt, make_fallback_prompt, media_urls_of
+from .content import MediaCollector, build_turn_text, flatten_single_prompt, make_fallback_prompt, media_urls_of, text_of
 from .cookies import GeminiCookies, resolve_cookies
 from .errors import UpstreamError, map_exception
 
 logger = logging.getLogger("gemini_openai_proxy.upstream")
 
-_ROLE_LABEL = {"user": "User", "assistant": "Assistant", "tool": "Assistant"}
+_ROLE_LABEL = {"user": "User", "assistant": "Assistant", "tool": "User"}
 _SYSTEM_ROLES = {"system", "developer"}
 
 
@@ -462,17 +462,21 @@ class GeminiService:
         """(system, history_pairs, final_user_text, final_msg, model_obj, display_name)."""
         model, display_name = self.resolve_model(request.model)
         last = request.messages[-1]
-        if str(last.role) != "user":
-            raise UpstreamError(400, "The last message must have role 'user'.")
+        last_role = str(last.role)
+        # A tool result is the model's next *input* (Codex agent loop), so it
+        # closes the turn exactly like a user message would.
+        if last_role not in ("user", "tool"):
+            raise UpstreamError(400, "The last message must have role 'user' (or 'tool' result).")
 
         system_parts: list[str] = []
         history: list[tuple[str, str]] = []
         for msg in request.messages[:-1]:
             label = _ROLE_LABEL.get(str(msg.role), "System")
-            text, _urls = build_turn_text(label, msg.content)
+            text, _urls = text_of(msg.content), []
             if str(msg.role) in _SYSTEM_ROLES:
                 system_parts.append(text)
             elif text.strip():
+                # raw text: make_fallback_prompt adds the "[Label]:" prefix
                 history.append((label, text))
         system = "\n\n".join(p for p in system_parts if p.strip()) or None
 
