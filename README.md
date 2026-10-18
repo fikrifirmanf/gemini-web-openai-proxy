@@ -180,8 +180,20 @@ delete those files and reinit if it ever goes stale mid-session.
 
 ```bash
 uv sync --all-groups
-uv run pytest tests/ -v          # 29 tests, offline, no cookies needed
+uv run pytest tests/ -v          # 30 tests, offline, no cookies needed
 ```
+
+### End-to-end endpoint smoke test (against a running proxy)
+
+```bash
+uv run uvicorn gemini_openai_proxy.main:app --port 8011 &   # in another shell
+uv run python scripts/test_proxy.py              # health, models, chat, multi-turn, SSE
+uv run python scripts/test_proxy.py --images     # + image generation (quota-heavy)
+uv run python scripts/test_proxy.py --key s3cret # + bearer auth round-trip
+uv run python scripts/test_proxy.py --base-url http://127.0.0.1:8011 --model gemini-flash
+```
+
+Exit code 0 when all checks pass (CI-friendly).
 
 Project layout:
 

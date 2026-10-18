@@ -1,4 +1,5 @@
 """OpenAI request/response schema tolerance."""
+import os
 
 from gemini_openai_proxy.schemas import ChatCompletionRequest, ImagesRequest, make_usage
 
@@ -56,6 +57,32 @@ def test_images_request_defaults():
     assert req.n == 1 and req.response_format == "b64_json"
 
 
+def test_dotenv_file_loader(tmp_path, monkeypatch):
+    from pathlib import Path as _P
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "# comment\n"
+        "GWOP_API_KEY='from file'\n"
+        "GWOP_PORT=9999\n"
+        "export GWOP_STRIP=q\n"
+    )
+    monkeypatch.delenv("GWOP_API_KEY", raising=False)
+    monkeypatch.delenv("GWOP_PORT", raising=False)
+    monkeypatch.delenv("GWOP_STRIP", raising=False)
+    from gemini_openai_proxy.config import _load_dotenv
+
+    _load_dotenv(_P(env))
+    assert os.environ["GWOP_API_KEY"] == "from file"
+    assert os.environ["GWOP_PORT"] == "9999"
+    assert os.environ["GWOP_STRIP"] == "q"
+    # a real environment variable must keep priority over the file
+    monkeypatch.setenv("GWOP_PORT", "7777")
+    _load_dotenv(_P(env))
+    assert os.environ["GWOP_PORT"] == "7777"
+
+
 def test_usage_math():
     usage = make_usage(800, 1200)
     assert usage == {"prompt_tokens": 200, "completion_tokens": 300, "total_tokens": 500}
+

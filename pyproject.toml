@@ -15,7 +15,10 @@ dependencies = [
 browser = ["browser-cookie3"]
 
 [dependency-groups]
-dev = ["pytest>=8.2"]
+dev = [
+    "pytest>=8.2",
+    "requests>=2.34.2",
+]
 
 [project.scripts]
 gemini-openai-proxy = "gemini_openai_proxy.__main__:main"

@@ -1,4 +1,8 @@
-"""Settings loaded from environment variables (prefix `GWOP_`)."""
+"""Settings loaded from environment variables (prefix `GWOP_`).
+
+A project-root `.env` file is auto-loaded into the environment first; real
+environment variables always win over file values.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ENV_PREFIX = "GWOP_"
+
+
+def _load_dotenv(env_file: Path = Path(".env")) -> None:
+    """Minimal dotenv: lines of KEY=VALUE (quotes optional, # comments ok)."""
+    if not env_file.is_file():
+        return
+    for raw in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("export "):
+            line = line.removeprefix("export ")
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'\"").strip()
+        if key and key not in os.environ:  # file never overrides a real env var
+            os.environ[key] = value
 
 
 def _get(key: str, default: str = "") -> str:
@@ -69,6 +90,7 @@ class Settings:
 
     @classmethod
     def load(cls) -> "Settings":
+        _load_dotenv()
         data_dir = Path(_get("DATA_DIR", "data")).expanduser().resolve()
         s = cls(
             host=_get("HOST", "127.0.0.1"),
