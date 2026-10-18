@@ -139,7 +139,11 @@ class GeminiService:
         self.ready = False
 
     async def reinit(self) -> dict[str, Any]:
-        """Admin endpoint: tear down and rebuild the upstream client."""
+        """Admin endpoint: tear down and rebuild the upstream client.
+
+        Re-reads .env/env first, so users can refresh cookies without restarting.
+        """
+        self.settings = Settings.load()  # picks up edited cookie values
         async with self._init_lock:
             if self.client:
                 with contextlib.suppress(Exception):

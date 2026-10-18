@@ -141,7 +141,7 @@ Precedence: `cookies.txt` **>** raw header **>** 1PSID pair. You only need one.
 | `GET /v1/models` | models your account has (live-discovered) |
 | `POST /v1/chat/completions` | chat; `stream=true` gives SSE |
 | `POST /v1/images/generations` | prompt in, `b64_json` out; reference images accepted via an extra `"image"` field (e.g. OpenAI SDK `extra_body={"image": [...]}`) |
-| `POST /admin/reinit` | force a fresh upstream session (after cookie changes) |
+| `POST /admin/reinit` | force a fresh upstream session; **re-reads `.env`** first (refresh cookies without restarting) |
 | `GET /admin/status` | banner + quota/usage snapshot when the account exposes it |
 
 ## How it maps an OpenAI conversation onto the web app
@@ -168,8 +168,9 @@ history.
 | `401 upstream_auth_error` | cookies expired / logout | re-copy the pair; `POST /admin/reinit` |
 | `429 upstream_rate_limited` | daily quota / IP block from parallel calls | wait, lower `GWOP_MAX_CONCURRENCY` |
 | `502 … did not return any images` | prompt phrased as "search for images" | ask it to *generate* an image |
-| models list only shows `gemini-flash-lite` | session is unauthenticated (anonymous tier) | provide valid cookies — Google may treat the anonymous session as signed-out |
+| models list only shows `gemini-flash-lite` | session is unauthenticated (anonymous tier) | **Chromium rotates `__Secure-1PSIDTS` within hours**: re-copy fresh `__Secure-1PSID` + `__Secure-1PSIDTS` values into `.env`, clear `GWOP_DATA_DIR/gemini_cookies`, then `POST /admin/reinit` (it now re-reads `.env` — no restart needed) or run `/reinit` in `scripts/chat.py` |
 | `503 No Gemini cookies found` | env vars missing/typo'd | see message; use exactly the cookie **values** (not the names) |
+| cookies keep expiring although you re-copy them | an interactive Chrome session keeps rotating `__Secure-1PSIDTS` under the proxy's feet | log in to gemini.google.com in a **separate private/incognito window**, export the cookies, close that window so nothing else rotates the session; Firefox cookies also rotate far less (browser-cookie3 path) |
 | Streaming clients hang | a proxy in front strips SSE? | server sets `X-Accel-Buffering: no`; bypass intermediate caching proxies |
 | behind a corporate proxy | `GWOP_HTTP_PROXY` missing | set it to your HTTP proxy URL |
 

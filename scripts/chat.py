@@ -249,6 +249,20 @@ class Shell:
             print(f"{GREEN}✓ upstream session rebuilt{RESET}")
         else:
             print(f"{RED}✗ {body.get('error', 'reinit failed')}{RESET}")
+        self.warn_if_anonymous()
+
+    def warn_if_anonymous(self) -> None:
+        """Shout when Google only serves the anonymous tier (cookie trouble)."""
+        resp = self.request("GET", "/admin/status")
+        if resp.status_code != 200:
+            return
+        status = self._parse(resp).get("account_status")
+        if status and status != "AVAILABLE":
+            print(
+                f"{YELLOW}⚠ Google reports {status} — you are on the anonymous tier "
+                f"(only gemini-flash-lite). Re-copy fresh __Secure-1PSID /"
+                f" __Secure-1PSIDTS cookies into .env, then run /reinit.{RESET}"
+            )
 
     def banner(self) -> None:
         histories = len(self.history)
@@ -332,6 +346,7 @@ def main() -> int:
         if args.effort is None:
             shell.choose_effort_interactively()
         shell.banner()
+        shell.warn_if_anonymous()
         try:
             shell.repl()
         except requests.ConnectionError:
