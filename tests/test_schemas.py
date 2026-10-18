@@ -86,3 +86,20 @@ def test_usage_math():
     usage = make_usage(800, 1200)
     assert usage == {"prompt_tokens": 200, "completion_tokens": 300, "total_tokens": 500}
 
+
+
+def test_codex_style_payload_with_tools_is_accepted():
+    """Codex CLI sends tools/tool_choice/stream_options; we accept + ignore them."""
+    payload = {
+        "model": "gemini-pro",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "shell", "parameters": {}}}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "stream_options": {"include_usage": True},
+        "reasoning_effort": "medium",
+        "store": False,
+    }
+    req = ChatCompletionRequest.model_validate(payload)
+    assert req.model == "gemini-pro"
+    assert req.reasoning_effort == "medium"
