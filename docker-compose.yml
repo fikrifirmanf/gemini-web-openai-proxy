@@ -1,0 +1,23 @@
+services:
+  gemini-openai-proxy:
+    build: .
+    image: gemini-openai-proxy:local
+    container_name: gemini-openai-proxy
+    restart: unless-stopped
+    ports:
+      - "8011:8011"
+    environment:
+      GWOP_HOST: 0.0.0.0
+      GWOP_PORT: "8011"
+      GWOP_LOG_LEVEL: INFO
+      GWOP_DATA_DIR: /app/data
+      # Provide exactly one cookie source:
+      GWOP_GEMINI_1PSID: ${GWOP_GEMINI_1PSID}
+      GWOP_GEMINI_1PSIDTS: ${GWOP_GEMINI_1PSIDTS}
+      # GWOP_GEMINI_COOKIES_RAW: '__Secure-1PSID=...; __Secure-1PSIDTS=...'
+      # GWOP_COOKIE_FILE: /app/data/cookies.txt     # mount it as a volume
+      # --- optional ---
+      # GWOP_API_KEY: please-change-me
+      # GWOP_HTTP_PROXY: http://172.17.0.1:7897
+    volumes:
+      - ./data:/app/data

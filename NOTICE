@@ -1,0 +1,18 @@
+# NOTICE
+
+gemini-openai-proxy is licensed under the GNU Affero General Public License
+version 3 (AGPL-3.0-or-later); see LICENSE for the full text.
+
+It depends on and derives from:
+
+* gemini-webapi (https://github.com/HanaokaYuzu/Gemini-API) by HanaokaYuzu and
+  contributors — an AGPL-3.0 reverse-engineered client for the Gemini web app.
+  All credit for the upstream protocol work belongs to that project.
+
+This software is **not affiliated with, endorsed by, or sponsored by Google**.
+It is an unofficial tool that automates requests to gemini.google.com using the
+user's own authenticated browser session.
+
+By using this software you assume responsibility for complying with Google's
+Terms of Service. Do not use it to circumvent rate limits or for abuse at
+scale, and never share your Gemini session cookies with anyone.
