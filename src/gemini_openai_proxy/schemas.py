@@ -7,11 +7,14 @@ that unexpected shapes degrade gracefully instead of 500-ing.
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from . import tools_emulation
 
 
 def new_completion_id() -> str:
@@ -45,6 +48,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     stream_options: dict[str, Any] | None = None
     reasoning_effort: str | None = None  # "high"/"medium" -> extended thinking
+    tool_mode: bool = False  # internal: Responses request with emulated tools (adds a send-time reminder)
 
     @property
     def wants_extended_thinking(self) -> bool:
@@ -98,30 +102,52 @@ class ResponsesRequest(BaseModel):
         if system:
             messages.append({"role": "system", "content": system})
 
+        tool_mode = bool(extra_system.strip())
+        names: dict[str, str] = {}              # call_id -> function name
+        pending_calls: list[tuple[str, str]] = []  # consecutive calls = one assistant turn
+        used_tools = False                      # a workspace-changing tool ran since the last user message
+
+        def flush_calls() -> None:
+            if pending_calls:
+                messages.append({"role": "assistant", "content": tools_emulation.render_calls(pending_calls)})
+                pending_calls.clear()
+
         if isinstance(self.input, str):
             messages.append({"role": "user", "content": self.input})
         else:
             for item in self.input:
                 if not isinstance(item, dict):
+                    flush_calls()
                     messages.append({"role": "user", "content": str(item)})
                     continue
                 kind = item.get("type", "message")
+                if kind in ("function_call", "custom_tool_call"):
+                    name = str(item.get("name") or "tool")
+                    if kind == "custom_tool_call":
+                        args = json.dumps({"input": str(item.get("input") or "")}, ensure_ascii=False)
+                    else:
+                        args = str(item.get("arguments") or "")
+                    if item.get("call_id"):
+                        names[str(item["call_id"])] = name
+                    pending_calls.append((name, args))
+                    used_tools = used_tools or tools_emulation.is_mutating(name, args)
+                    continue
+                flush_calls()
                 if kind == "message":
                     role = str(item.get("role", "user"))
-                    messages.append({"role": role, "content": _flatten_content(item.get("content"))})
-                elif kind == "function_call":
-                    name = str(item.get("name") or "tool")
-                    messages.append({
-                        "role": "assistant",
-                        "content": f"[Tool request] {name} {item.get('arguments') or ''}",
-                    })
-                elif kind == "function_call_output":
-                    name = str(item.get("call_id") or "tool_call")
-                    messages.append({
-                        "role": "tool",
-                        "content": f"[tool result for {name}]\n{_flatten_content(item.get('output'))}",
-                    })
+                    content = _flatten_content(item.get("content"))
+                    if tool_mode and role == "assistant":
+                        content = tools_emulation.scrub_history(content, used_tools)
+                    elif role == "user":
+                        used_tools = False
+                    messages.append({"role": role, "content": content})
+                elif kind in ("function_call_output", "custom_tool_call_output"):
+                    call_id = str(item.get("call_id") or "")
+                    label = names.get(call_id) or call_id or "tool_call"
+                    body = tools_emulation.clip_output(_flatten_content(item.get("output")))
+                    messages.append({"role": "tool", "content": f"[Tool result: {label}]\n{body}"})
                 # reasoning / item_reference / mcp_* -> no Gemini Web equivalent.
+            flush_calls()
 
         messages = [m for m in messages if str(m.get("content") or "").strip() or m["role"] == "system"]
         if not messages:
@@ -131,6 +157,7 @@ class ResponsesRequest(BaseModel):
             messages=messages,
             stream=self.stream,
             reasoning_effort=self.effort,
+            tool_mode=tool_mode,
         )
 
 

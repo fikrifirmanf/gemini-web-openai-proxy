@@ -6,14 +6,29 @@ quota) into a drop-in `base_url` for any OpenAI-style client — no official API
 
 ```text
 OpenAI client ──HTTP──▶ this proxy ──cookie session──▶ gemini.google.com
-                        /v1/chat/completions
+                        /v1/chat/completions   (Chat Completions API)
+                        /v1/responses          (Responses API — OpenAI Codex CLI)
                         /v1/models
                         /v1/images/generations
 ```
 
 No API key, no billing. Chat, vision (send images/files), generated-image extraction,
-SSE streaming, thinking-mode passthrough, optional bearer auth, Docker, cookie
-auto-refresh.
+SSE streaming, thinking-mode passthrough, **tool-calling emulation for coding agents
+(OpenAI Codex CLI, incl. MCP tools)**, optional bearer auth, Docker, cookie auto-refresh
+and self-healing.
+
+## Contents
+
+[Quick start](#quick-start) · [Wiring a client](#wiring-a-client) ·
+[Features](#features) · [Configuration](#configuration-env-vars-gwop_-prefix) ·
+[Endpoints](#endpoints) · [Using it with Codex CLI](#using-it-with-openai-codex-cli) ·
+[Tool-calling emulation](#how-tool-calling-emulation-works) ·
+[Debugging](#debugging-a-misbehaving-agent-loop) ·
+[Cookie self-healing](#self-healing-cookie-rotation) ·
+[Abuse safety](#being-treated-like-a-human-abuse-safety) ·
+[Conversation mapping](#how-it-maps-an-openai-conversation-onto-the-web-app) ·
+[Troubleshooting](#troubleshooting) · [Development](#development) ·
+[Licensing](#licensing)
 
 > ⚠️ **Unofficial & unaffiliated with Google.** It automates the web app with your own
 > session and may break when Google changes internals. Attribution: built on the
@@ -72,6 +87,9 @@ export GWOP_GEMINI_1PSIDTS='sidts-Cj...'
 docker compose up -d          # cookies cache persists under ./data
 ```
 
+The container binds `0.0.0.0`; publish the port on localhost only (or set `GWOP_API_KEY`) unless you
+really want it reachable from other machines.
+
 ---
 
 ## Wiring a client
@@ -98,6 +116,8 @@ provider = "OpenAI", base URL as above, API key = anything.
 
 | Feature | Notes |
 | --- | --- |
+| Responses API | `POST /v1/responses` (streaming + non-streaming) for Codex CLI ≥ 0.145, which no longer speaks Chat Completions |
+| Tool calling | Prompt-based emulation: function tools, Codex `apply_patch` (custom tool) and MCP tools become real `function_call` items; see [below](#how-tool-calling-emulation-works) |
 | Chat completions | Multi-turn stateless mapping, system messages flattened into the prompt |
 | Streaming (SSE) | True incremental deltas from `send_message_stream`; `stream_options.include_usage` supported; malformed upstream failures surface as an SSE `error` event, then `[DONE]` |
 | Vision & files | `[image_url]` content parts: `data:` URL, http(s) URL, or local path; also PDF/text file pairs (`file_url`); sent upstream as attachments |
@@ -127,14 +147,21 @@ provider = "OpenAI", base URL as above, API key = anything.
 | `GWOP_STRICT_MODEL` | `0` | `1` → unknown model strings return **400** instead of falling back to default |
 | `GWOP_IMAGES_IN_CHAT` | `1` | append generated-image markdown to chat replies |
 | `GWOP_INCLUDE_THOUGHTS` | `1` | `0` hides `reasoning_content` |
-| `GWOP_REQUEST_TIMEOUT` | `300` | per upstream call |
-| `GWOP_INIT_TIMEOUT` | `120` | session handshake |
+| `GWOP_REQUEST_TIMEOUT` | `450` | max wait for one generation |
+| `GWOP_STALL_TIMEOUT` | `240` | idle stream before the library reconnects and re-sends the prompt |
+| `GWOP_TOTAL_TIMEOUT` | `900` | hard cap per non-stream call, library retries included (504) |
+| `GWOP_INIT_TIMEOUT` | `120` | session handshake only |
+| `GWOP_SSE_KEEPALIVE` | `15` | idle seconds before an SSE `: keepalive` comment (0 = off) |
 | `GWOP_AUTO_RECOVERY` | `1` | self-healing: when Google reports the session unauthenticated, rotate `__Secure-1PSIDTS` from the long-lived 1PSID and rebuild the client in the background |
 | `GWOP_RECOVERY_INTERVAL` | `60` | seconds between recovery checks |
 | `GWOP_RECOVERY_MAX_ATTEMPTS` | `5` | consecutive failed rounds before recovery goes dormant (until `POST /admin/reinit` re-arms it) |
 | `GWOP_SEND_INTERVAL` | `1.5` | min jittered gap in seconds between upstream sends (burst pacing) |
 | `GWOP_QUOTA_COOLDOWN` | `300` | seconds new requests are locally 429'd (`Retry-After`) after an upstream 429 |
 | `GWOP_SINGLE_INSTANCE` | `1` | flock-protect the data dir; a 2nd proxy process aborts instead of racing cookie rotation |
+| `GWOP_TOOL_EMULATION` | `1` | `/v1/responses`: turn declared tools into the JSON/raw-block protocol and lift replies into `function_call` items. `0` → tools are ignored and Gemini answers in plain text |
+| `GWOP_TOOL_ROUND_THINKING` | `1` | honour the requested reasoning effort on **every** agent round. `0` skips extended thinking on rounds that only answer a tool result (faster, but Gemini Web then returns canned errors / fake summaries about half the time) |
+| `GWOP_TOOL_EXCLUDE` | `^(multi_agent\|mcp__codex_apps__)` | regex of Codex tool names/namespaces **not** offered to Gemini (hosted/connector tools it can't use well; keeps the prompt small) |
+| `GWOP_DEBUG_DUMP_DIR` | *(unset)* | write every upstream prompt + reply (and the declared tool list) as JSON files for debugging. Contains your prompts and code — keep it local |
 
 Precedence: `cookies.txt` **>** raw header **>** 1PSID pair. You only need one.
 
@@ -146,7 +173,7 @@ Precedence: `cookies.txt` **>** raw header **>** 1PSID pair. You only need one.
 | `GET /readyz` | readiness: 200 when the web session is live, 503 with a reason otherwise |
 | `GET /v1/models` | models your account has (live-discovered) |
 | `POST /v1/chat/completions` | chat; `stream=true` gives SSE |
-| `POST /v1/responses` | OpenAI **Responses API** (Codex ≥0.145 talks this); instructions + input items → Gemini Web; chat semantics |
+| `POST /v1/responses` | OpenAI **Responses API** (Codex ≥0.145 talks this); instructions + input items → Gemini Web; streaming and non-streaming, with emulated tool calling |
 | `POST /v1/images/generations` | prompt in, `b64_json` out; reference images accepted via an extra `"image"` field (e.g. OpenAI SDK `extra_body={"image": [...]}`) |
 | `POST /admin/reinit` | force a fresh upstream session; **re-reads `.env`** first (refresh cookies without restarting); re-arms the recovery breaker |
 | `GET /admin/status` | banner + quota/usage snapshot when the account exposes it (includes the `recovery` state) |
@@ -237,20 +264,101 @@ model_provider = "gemini-web"
 Then: `codex --profile gemini-flash` (also `gemini-flash-lite` / `gemini-pro` /
 `gemini-argon`).
 
-**Tool calling (emulated, works)**: when a request declares function tools, the proxy
-injects a protocol instructing Gemini to answer with a strict
-`{"tool_calls": [{"name": …, "arguments": {…}}]}` JSON object; the proxy lifts that into
-real Responses-API `function_call` items, Codex executes them, and the loop closes with
-`function_call_output` turns. Verified live end-to-end (multi-round file create/append/cat
-through codex's `exec_command`). Caveats:
+Recommended profile for coding work (`gemini-argon` with high effort works well; see
+the [thinking caveats](#thinking-effort-reality-check-measured-live) for `gemini-pro`):
 
-- it is prompt-based — robustness depends on the model obeying the protocol;
-  the proxy mitigates Gemini Web's flaky JSON with a bare-key/comma repair pass
-  and a single corrective retry when a reply clearly *meant* to call tools but
-  arrived mangled (plain prose answers fall through untouched);
-- each Codex round trip is a fresh Gemini Web send (web sessions are stateless for us),
-   so agent tasks consume multiple upstream turns and must respect the pacing interval;
-- disable with `GWOP_TOOL_EMULATION=0` (tools then fall back to plain chat answers).
+```toml
+model = "gemini-argon"
+model_provider = "gemini-web"
+model_reasoning_effort = "high"
+```
+
+Start a **new** Codex session after changing proxy versions — a resumed session replays
+old assistant turns (including past refusals) that teach the model bad habits.
+
+### MCP tools in Codex
+
+MCP servers configured in Codex (`[mcp_servers.*]`) are forwarded to the proxy as
+namespaced tools. The proxy flattens each namespace into individual function names for
+Gemini, and restores the `namespace` on the way back so Codex routes the call to the
+right server. Verified live: `McpToolCall` events complete normally. Notes:
+
+- Tools matching `GWOP_TOOL_EXCLUDE` (by default Codex's hosted `multi_agent` and
+  `mcp__codex_apps__*` connectors) are never offered.
+- If two servers expose the same tool name, the first one wins.
+
+## How tool-calling emulation works
+
+Gemini Web has no function-calling API, so the proxy emulates one when a request declares
+tools:
+
+1. **Protocol prompt.** A compact tool catalogue plus the reply protocol is added to the
+   system instructions, written in the user's voice (framing it as the user's own harness
+   avoids Gemini treating it as a "prompt injection"). A short reminder is appended to
+   each outgoing turn at send time.
+2. **Two reply formats.** Gemini answers with either JSON,
+   `{"tool_calls": [{"name": "...", "arguments": {...}}]}`, or **raw blocks** for
+   code-heavy arguments where JSON escaping breaks:
+
+   ```text
+   @@tool exec_command
+   @@arg cmd
+   cat > src/app.js << 'EOF'
+   console.log("no escaping needed");
+   EOF
+   @@end
+   ```
+
+3. **Lifting.** The proxy parses the reply (with bare-key/comma repair and tolerance for
+   trailing junk), coerces arguments to the declared JSON schema (string → array,
+   numeric strings → numbers), and emits real `function_call` / `custom_tool_call`
+   items. Codex runs them and sends back `function_call_output`, closing the loop.
+4. **Guard rails** — Gemini Web is flaky, so replies are checked and given **one
+   corrective retry** when they:
+   - are mangled JSON / a failed raw block,
+   - call a tool name that was never declared (e.g. an invented `shell`),
+   - are a canned Google error ("I'm having trouble…"),
+   - refuse with an invented limit ("my tool budget is exhausted") or call the protocol
+     a prompt injection,
+   - *announce* an action in prose instead of doing it ("I will now create…"),
+   - claim the work is done when no file-changing call actually ran this turn
+     (reads, `pnpm dev`, `pnpm build` don't count as changes).
+   Past assistant turns of those kinds are also scrubbed from the replayed history so
+   they are not copied.
+5. **Speed.** The proxy re-keys the cached web session under the assistant turn it just
+   returned, so round N sends only the newest tool result instead of the whole
+   transcript. Tool results are clipped to ~12k characters (head + tail), and the tool
+   catalogue is compacted. Tool rounds are buffered (the JSON is never streamed to the
+   client as text); plain answers stream incrementally. An SSE keep-alive comment is sent
+   while Gemini thinks so Codex doesn't time out.
+6. **Final-text integrity.** Gemini Web rewrites text after streaming starts (e.g. wraps
+   URLs as `[url](url)`), which can make delta diffs lose characters. The proxy uses the
+   final full snapshot, unwraps bare-URL auto-links, and keys the session cache on exactly
+   what Codex will send back.
+7. **Cheap titles.** Codex's hidden "generate a task title" request is answered without the
+   coding-agent system prompt and without extended thinking.
+
+Limits to be aware of: it is prompt-based, so quality depends on the model obeying the
+protocol; each agent round is one upstream Gemini turn (and obeys the pacing interval);
+very long sessions can fall off the session cache and re-send the history once. Disable
+everything with `GWOP_TOOL_EMULATION=0`.
+
+## Debugging a misbehaving agent loop
+
+Set `GWOP_DEBUG_DUMP_DIR=./data/dump` and restart. For every upstream send the proxy
+writes `HHMMSS-mmm.json` (`prompt`, `reply`, `reused_session`, `extended_thinking`) and,
+per Responses request, `tools-HHMMSS.json` (the tool names Codex declared). Compare them
+with Codex's own session rollout in `~/.codex/sessions/YYYY/MM/DD/*.jsonl`:
+
+- `reused_session: false` with a huge prompt on a late turn → session cache miss
+  (slower; check that Codex's stored text matches the proxy's last reply).
+- A reply that is prose where a tool call was expected → look for the retry log lines
+  (`corrective retry`, `unsupported call`).
+- `docker`/service logs at `GWOP_LOG_LEVEL=DEBUG` show the upstream watchdog and
+  reconnect events.
+
+The dump files hold your prompts and code: they live under the git-ignored `data/` folder
+by default, never commit or share them blindly.
 
 ## How it maps an OpenAI conversation onto the web app
 
@@ -280,6 +388,9 @@ history.
 | `503 No Gemini cookies found` | env vars missing/typo'd | see message; use exactly the cookie **values** (not the names) |
 | cookies keep expiring although you re-copy them | an interactive Chrome session keeps rotating `__Secure-1PSIDTS` under the proxy's feet | log in to gemini.google.com in a **separate private/incognito window**, export the cookies, close that window so nothing else rotates the session; Firefox cookies also rotate far less (browser-cookie3 path) |
 | Streaming clients hang | a proxy in front strips SSE? | server sets `X-Accel-Buffering: no`; bypass intermediate caching proxies |
+| Codex says "tool budget exhausted" / "prompt injection" / only narrates actions | old proxy version, or a resumed session that replays old refusals | restart the proxy and start a **new** Codex session; with `GWOP_DEBUG_DUMP_DIR` check the latest dump |
+| Logs show `Heartbeat triggered` / `[Watchdog] Connection idle … Attempting recovery` | Gemini produced nothing for `GWOP_STALL_TIMEOUT` (long thinking on high effort) | normal self-recovery; raise `GWOP_STALL_TIMEOUT` / `GWOP_REQUEST_TIMEOUT` if it fires too early |
+| Agent rounds randomly return "I'm having trouble…" | Gemini Web canned error, more frequent with thinking off on tool rounds | keep `GWOP_TOOL_ROUND_THINKING=1`; the proxy already retries once |
 | behind a corporate proxy | `GWOP_HTTP_PROXY` missing | set it to your HTTP proxy URL |
 
 The runtime cookie cache lives at `GWOP_DATA_DIR/gemini_cookies/.cached_cookies_*.json`;
@@ -289,7 +400,7 @@ delete those files and reinit if it ever goes stale mid-session.
 
 ```bash
 uv sync --all-groups
-uv run pytest tests/ -v          # 30 tests, offline, no cookies needed
+uv run pytest tests/ -v          # ~120 tests, offline, no cookies needed
 ```
 
 ### CLI chatbot
@@ -336,11 +447,12 @@ Project layout:
 src/gemini_openai_proxy/
 ├── config.py       # env settings
 ├── cookies.py      # 3 cookie sources
-├── schemas.py      # OpenAI pydantic models
+├── schemas.py      # OpenAI pydantic models (Chat Completions + Responses → chat request)
 ├── content.py      # message flattening + attachments
 ├── errors.py       # upstream exception → HTTP mapping
-├── upstream.py     # GeminiClient lifecycle, session cache, generation
-├── routes/         # meta | chat | images
+├── upstream.py     # GeminiClient lifecycle, session cache, timeouts, generation
+├── tools_emulation.py  # tool protocol prompt, parsers, refusal/fake-done detectors
+├── routes/         # meta | chat | responses | images (+ SSE keep-alive helper)
 └── main.py         # app factory, auth middleware, lifespan
 ```
 

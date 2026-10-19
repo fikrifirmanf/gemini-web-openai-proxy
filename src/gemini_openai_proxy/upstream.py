@@ -43,7 +43,9 @@ from gemini_webapi.utils.rotate_1psidts import rotate_1psidts
 from .config import Settings
 from .content import MediaCollector, build_turn_text, flatten_single_prompt, make_fallback_prompt, media_urls_of, text_of
 from .cookies import GeminiCookies, resolve_cookies
+from . import tools_emulation
 from .errors import UpstreamError, map_exception
+from .schemas import ChatMessage
 
 logger = logging.getLogger("gemini_openai_proxy.upstream")
 
@@ -388,12 +390,20 @@ class GeminiService:
                 merged.update(cookies.extra)
                 client.cookies = merged
         try:
-            await client.init(
+            # `timeout`/`watchdog_timeout` govern *generation* (and the library re-inits
+            # and re-sends on a stall), so they must not be the short init budget.
+            await asyncio.wait_for(
+                client.init(
+                    timeout=self.settings.request_timeout,
+                    watchdog_timeout=min(self.settings.stall_timeout, self.settings.request_timeout),
+                    auto_refresh=True,
+                    verbose=self.settings.log_level == "DEBUG",
+                ),
                 timeout=self.settings.init_timeout,
-                auto_refresh=True,
-                verbose=self.settings.log_level == "DEBUG",
             )
         except Exception as exc:  # noqa: BLE001
+            with contextlib.suppress(Exception):
+                await client.close()
             mapped = map_exception(exc)
             self.last_init_error = mapped.message
             self.ready = False
@@ -483,6 +493,9 @@ class GeminiService:
         final_text = build_turn_text("User", last.content)[0].removeprefix("[User]: ")
         if not final_text.strip() and not media_urls_of(last.content):
             raise UpstreamError(400, "The final user message is empty.")
+        if getattr(request, "tool_mode", False):
+            # sent text only — keeping it out of the message keeps cache keys stable
+            final_text += tools_emulation.turn_suffix(last_role)
         return system, history, final_text, last, model, display_name
 
     @staticmethod
@@ -507,10 +520,60 @@ class GeminiService:
         while len(self._sessions) > self.settings.session_cache_size:
             self._sessions.popitem(last=False)
 
+    def _dump(self, prompt: str, reused: bool, thinking: bool, reply: str) -> None:
+        """Opt-in (GWOP_DEBUG_DUMP_DIR): persist what was really sent upstream."""
+        directory = self.settings.debug_dump_dir
+        if not directory:
+            return
+        with contextlib.suppress(OSError):
+            path = Path(directory).expanduser()
+            path.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+            (path / f"{stamp}.json").write_text(
+                json.dumps(
+                    {"reused_session": reused, "extended_thinking": thinking,
+                     "prompt_chars": len(prompt), "prompt": prompt, "reply": reply},
+                    ensure_ascii=False, indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+    def remember_reply(self, request: Any, reply_text: str) -> None:
+        """Make the next turn of this conversation hit the cached web session.
+
+        `_remember` keys the session by the request's messages only, but the client's
+        next request also carries our assistant reply in its history. Re-key the same
+        session under messages + that reply (rendered exactly as the client will
+        replay it) so agent loops send just the newest turn instead of the whole
+        growing transcript.
+        """
+        if not reply_text or not reply_text.strip():
+            return
+        try:
+            system, _h, _t, _l, _m, display_name = self._split(request)
+        except UpstreamError:
+            return
+        thinking = request.wants_extended_thinking
+        entry = self._sessions.get(self._hash_for(request.messages, system, display_name, thinking))
+        if entry is None:
+            return
+        extended = [*request.messages, ChatMessage(role="assistant", content=reply_text)]
+        self._sessions[self._hash_for(extended, system, display_name, thinking)] = entry
+        while len(self._sessions) > self.settings.session_cache_size:
+            self._sessions.popitem(last=False)
+
+    def _effective_thinking(self, request: Any) -> bool:
+        """Requested extended thinking, minus tool-result rounds unless opted in."""
+        if not request.wants_extended_thinking:
+            return False
+        last_is_tool = str(request.messages[-1].role) == "tool"
+        return self.settings.tool_round_thinking or not last_is_tool
+
     async def chat_non_stream(self, request: Any) -> tuple[Any, str, list[str]]:
         """Returns (final ModelOutput, advertised model name, media notes)."""
         await self._ensure_ready()
         thinking = request.wants_extended_thinking
+        send_thinking = self._effective_thinking(request)
         system, history, final_text, _last, model_obj, display_name = self._split(request)
         messages = request.messages
         full_key = self._hash_for(messages, system, display_name, thinking)
@@ -522,10 +585,12 @@ class GeminiService:
             await collector.collect(messages, only_last=True)
             files, notes = collector.files, collector.notes
             try:
-                output = await self._send(entry.chat, final_text, files, thinking)
+                output = await self._send(entry.chat, final_text, files, send_thinking)
             finally:
                 self._cleanup_files(files)
             self._remember(full_key, entry.chat, display_name)
+            self.remember_reply(request, getattr(output, "text", ""))
+            self._dump(final_text, True, send_thinking, getattr(output, "text", ""))
             return output, display_name, notes
 
         collector = self._media_collector()
@@ -538,16 +603,19 @@ class GeminiService:
         )
         chat = self.client.start_chat(model=model_obj)
         try:
-            output = await self._send(chat, prompt, files, thinking)
+            output = await self._send(chat, prompt, files, send_thinking)
         finally:
             self._cleanup_files(files)
         self._remember(full_key, chat, display_name)
+        self.remember_reply(request, getattr(output, "text", ""))
+        self._dump(prompt, False, send_thinking, getattr(output, "text", ""))
         return output, display_name, notes
 
     async def chat_stream(self, request: Any) -> AsyncGenerator[Any, None]:
         """Yields incremental ModelOutput chunks; the final one carries images."""
         await self._ensure_ready()
         thinking = request.wants_extended_thinking
+        send_thinking = self._effective_thinking(request)
         system, history, final_text, _last, model_obj, display_name = self._split(request)
         messages = request.messages
         full_key = self._hash_for(messages, system, display_name, thinking)
@@ -571,12 +639,16 @@ class GeminiService:
                 else flatten_single_prompt(final_text, system)
             )
 
+        last_text = ""
         try:
-            async for chunk in self._send_raw(chat, prompt, files, thinking):
+            async for chunk in self._send_raw(chat, prompt, files, send_thinking):
+                last_text = getattr(chunk, "text", "") or last_text
                 yield chunk
         finally:
             self._cleanup_files(files)
             self._remember(full_key, chat, display_name)
+            self.remember_reply(request, last_text)
+            self._dump(prompt, entry is not None, send_thinking, last_text)
 
     # ---------------------------------------------------------- send helpers
 
@@ -687,12 +759,22 @@ class GeminiService:
         async with self._gate:
             await self._respect_send_interval()
             try:
-                return await chat.send_message(
-                    prompt,
-                    files=files or None,
-                    temporary=self.settings.temporary_chats,
-                    extended_thinking=thinking,
+                # the library retries stalled sends up to 5x with growing delays;
+                # cap the whole call so a client never waits unboundedly
+                return await asyncio.wait_for(
+                    chat.send_message(
+                        prompt,
+                        files=files or None,
+                        temporary=self.settings.temporary_chats,
+                        extended_thinking=thinking,
+                    ),
+                    timeout=self.settings.total_timeout or None,
                 )
+            except asyncio.TimeoutError as exc:
+                raise UpstreamError(
+                    504, f"Gemini did not finish within {self.settings.total_timeout:.0f}s.",
+                    hint="Raise GWOP_TOTAL_TIMEOUT / GWOP_REQUEST_TIMEOUT, or use a faster model.",
+                ) from exc
             except Exception as exc:  # noqa: BLE001
                 mapped = map_exception(exc)
                 self._on_send_mapped(mapped, self)

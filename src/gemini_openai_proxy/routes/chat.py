@@ -10,7 +10,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..errors import UpstreamError, map_exception
-from . import cooldown_guard
+from . import SSE_KEEPALIVE_FRAME, cooldown_guard, with_keepalive
 from ..schemas import ChatCompletionRequest, make_usage, new_completion_id, unix_ts
 
 logger = logging.getLogger("gemini_openai_proxy.chat")
@@ -126,7 +126,10 @@ def _stream(svc, req: ChatCompletionRequest, model_name: str):
         yield f"data: {json.dumps(_delta_chunk(cid, model_name, {'role': 'assistant'}))}\n\n"
         try:
             output = None
-            async for chunk in svc.chat_stream(req):
+            async for chunk in with_keepalive(svc.chat_stream(req), svc.settings.sse_keepalive):
+                if chunk is None:
+                    yield SSE_KEEPALIVE_FRAME
+                    continue
                 output = chunk
                 if svc.settings.include_thoughts:
                     thoughts = getattr(chunk, "thoughts_delta", "") or ""

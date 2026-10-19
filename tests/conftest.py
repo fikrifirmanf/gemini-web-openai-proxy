@@ -71,6 +71,9 @@ class StubService:
         self.calls: list = []
         self.client = _StubClient(self)
 
+    def remember_reply(self, request, reply_text) -> None:
+        self.calls.append(("remember_reply", reply_text))
+
     # lifecycle ------------------------------------------------------------
     async def start(self) -> None:
         return None

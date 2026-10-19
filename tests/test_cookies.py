@@ -54,3 +54,17 @@ def test_resolve_pair_ok():
 def test_resolve_nothing_is_empty_object():
     got = resolve_cookies(cookie_1psid="", cookie_1psidts="", cookie_raw="", cookie_file="")
     assert not got
+
+
+def test_dotenv_strips_inline_comments_but_keeps_quoted_hash(tmp_path, monkeypatch):
+    from gemini_openai_proxy.config import _load_dotenv
+
+    env = tmp_path / ".env"
+    env.write_text("GWOP_T_A=450   # note\nGWOP_T_B='x # y'\nGWOP_T_C=\"q\"\nGWOP_T_D=a#b\n")
+    for k in ("A", "B", "C", "D"):
+        monkeypatch.delenv(f"GWOP_T_{k}", raising=False)
+    _load_dotenv(env)
+    import os
+    assert [os.environ[f"GWOP_T_{k}"] for k in "ABCD"] == ["450", "x # y", "q", "a#b"]
+    for k in "ABCD":
+        os.environ.pop(f"GWOP_T_{k}", None)

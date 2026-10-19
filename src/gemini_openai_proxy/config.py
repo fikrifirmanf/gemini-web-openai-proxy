@@ -7,6 +7,7 @@ environment variables always win over file values.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,7 +26,11 @@ def _load_dotenv(env_file: Path = Path(".env")) -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip().strip("'\"").strip()
+        value = value.strip()
+        if value[:1] in ("'", '"') and value.count(value[0]) >= 2:
+            value = value[1 : value.index(value[0], 1)]  # quoted: keep any '#' inside
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()  # unquoted: drop inline comment
         if key and key not in os.environ:  # file never overrides a real env var
             os.environ[key] = value
 
@@ -78,8 +83,11 @@ class Settings:
 
     # behaviour
     data_dir: Path = field(default_factory=lambda: Path("data").resolve())
-    request_timeout: float = 300.0
-    init_timeout: float = 120.0
+    request_timeout: float = 450.0   # max wait for one Gemini generation (gemini_webapi `timeout`)
+    stall_timeout: float = 240.0     # idle-stream threshold before the lib drops + re-sends (watchdog)
+    total_timeout: float = 900.0     # hard cap for a whole non-stream call incl. library retries
+    init_timeout: float = 120.0      # cap for the init handshake only
+    sse_keepalive: float = 15.0      # seconds of silence before an SSE ": keepalive" comment
     max_concurrency: int = 3
     session_cache_size: int = 256
     temporary_chats: bool = True  # don't save conversations into Gemini history
@@ -103,6 +111,19 @@ class Settings:
     # experimental: emulate OpenAI tool-calling for Codex by prompting Gemini to
     # emit a strict JSON block, parsing it, and returning real function_call items
     tool_emulation: bool = True
+    # honour the requested reasoning effort on every agent round. Turning this off
+    # skips extended thinking on rounds that only answer a tool result: faster, but
+    # live logs showed Gemini Web then returns canned errors / fake summaries about
+    # half the time on those rounds
+    tool_round_thinking: bool = True
+
+    # namespaces (Codex MCP servers / internal tools) matching this regex are not
+    # offered to Gemini: Codex-internal ones only bloat the prompt
+    tool_exclude: str = r"^(multi_agent|mcp__codex_apps__)"
+
+    # debugging: write every upstream prompt + reply as JSON files here (contains
+    # your conversation text; leave empty in normal use)
+    debug_dump_dir: str = ""
 
     @classmethod
     def load(cls) -> "Settings":
@@ -119,7 +140,10 @@ class Settings:
             cookie_file=_get("COOKIE_FILE"),
             upstream_proxy=_get("HTTP_PROXY"),
             data_dir=data_dir,
-            request_timeout=_get_float("REQUEST_TIMEOUT", 300.0),
+            request_timeout=_get_float("REQUEST_TIMEOUT", 450.0),
+            stall_timeout=_get_float("STALL_TIMEOUT", 240.0),
+            total_timeout=_get_float("TOTAL_TIMEOUT", 900.0),
+            sse_keepalive=_get_float("SSE_KEEPALIVE", 15.0),
             init_timeout=_get_float("INIT_TIMEOUT", 120.0),
             max_concurrency=_get_int("MAX_CONCURRENCY", 3),
             session_cache_size=_get_int("SESSION_CACHE_SIZE", 256),
@@ -134,6 +158,9 @@ class Settings:
             quota_cooldown=_get_float("QUOTA_COOLDOWN", 300.0),
             single_instance=_get_bool("SINGLE_INSTANCE", True),
             tool_emulation=_get_bool("TOOL_EMULATION", True),
+            tool_round_thinking=_get_bool("TOOL_ROUND_THINKING", True),
+            tool_exclude=os.environ.get(ENV_PREFIX + "TOOL_EXCLUDE", r"^(multi_agent|mcp__codex_apps__)").strip(),
+            debug_dump_dir=_get("DEBUG_DUMP_DIR"),
         )
         # gemini_webapi persists auto-refreshed __Secure-1PSIDTS cookies here.
         # Must be set before the gemini_webapi module is imported.
